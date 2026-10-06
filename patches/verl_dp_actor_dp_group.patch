@@ -1,0 +1,51 @@
+--- dp_actor.py.orig_20261003	2026-10-03 06:53:09.979412887 +0800
++++ dp_actor.py	2026-10-03 06:53:38.471547847 +0800
+@@ -110,6 +110,26 @@
+                 f"{self.use_fused_kernels=} or {self.use_prefix_grouper=} for now."
+             )
+ 
++    def _dp_group(self):
++        """Process group across which rearrange_micro_batches must align its micro-batch count.
++
++        LOCAL PATCH (2026-10-03). Without this, prepare_dynamic_batch() runs with
++        dp_group=None, which silently disables the all_reduce(MAX) in
++        verl/utils/seqlen_balancing.py:402 -- that branch is gated on `dp_group is not None`,
++        NOT on `same_micro_num_in_dp` (which defaults to True and is misleading). Each DP rank
++        then derives num_micro_batches from its own shard's token total; the rank with fewer
++        micro-batches leaves the loop early and stops joining FSDP's per-layer
++        _ALLGATHER_BASE, so the rest busy-wait until nccl_timeout. Mirrors
++        FSDPEngine.get_data_parallel_group() (verl/workers/engine/fsdp/transformer_impl.py:558),
++        which the engine path already passes at transformer_impl.py:583.
++
++        With ulysses SP on we keep the old behaviour (None): the DP sub-group cannot be derived
++        from here, and this run uses sp=1.
++        """
++        if not torch.distributed.is_initialized() or self.use_ulysses_sp:
++            return None
++        return torch.distributed.group.WORLD
++
+     def _forward_micro_batch(
+         self, micro_batch: dict[str, torch.Tensor], temperature: float, calculate_entropy: bool = False
+     ) -> dict[str, torch.Tensor]:
+@@ -465,7 +485,9 @@
+ 
+         if use_dynamic_bsz:
+             max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
+-            micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
++            micro_batches, batch_idx_list = prepare_dynamic_batch(
++                data, max_token_len=max_token_len, dp_group=self._dp_group()
++            )
+         else:
+             micro_batches = data.split(micro_batch_size)
+ 
+@@ -557,7 +579,9 @@
+             for batch_idx, mini_batch in enumerate(mini_batches):
+                 if self.config.use_dynamic_bsz:
+                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+-                    micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
++                    micro_batches, _ = prepare_dynamic_batch(
++                        mini_batch, max_token_len=max_token_len, dp_group=self._dp_group()
++                    )
+                 else:
+                     self.gradient_accumulation = (
+                         self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu

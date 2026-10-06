@@ -1,0 +1,13 @@
+=== [18:04:13] 开始 base ===
+[base] 退出码 0
+val/reward:0.6254738438210766
+日志 /workspace/agl-checkpoints/gsm8k_r1/eval_full1319_base/eval.log
+=== [18:15:11] base 结束 ===
+=== [18:15:11] 开始 step1550 ===
+[step1550] 退出码 0
+val/reward:0.7816527672479151
+日志 /workspace/agl-checkpoints/gsm8k_r1/eval_full1319_step1550/eval.log
+=== [18:26:09] step1550 结束 ===
+=== 汇总 ===
+base  val/reward:0.6254738438210766
+step1550  val/reward:0.7816527672479151

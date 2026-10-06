@@ -1,0 +1,26 @@
+# backups / caches
+*.bak
+*.bak.*
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+
+# secrets (never committed; see README "Secrets" section)
+*.env
+*token*
+!*token_len*
+.kaggle/
+
+# data, weights, trajectories, logs (kept out of git on purpose)
+*.jsonl
+*.jsonl.gz
+*.parquet
+*.zip
+*.tar.zst
+*.pt
+*.safetensors
+*.log
+!gsm8k/results/*.log
+checkpoints/
+global_step_*/

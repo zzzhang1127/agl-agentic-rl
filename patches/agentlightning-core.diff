@@ -1,0 +1,1390 @@
+diff --git a/agentlightning/server/proxy.py b/agentlightning/server/proxy.py
+old mode 100644
+new mode 100755
+index fb63884..a931cd3
+--- a/agentlightning/server/proxy.py
++++ b/agentlightning/server/proxy.py
+@@ -9,6 +9,7 @@ import hashlib
+ import json
+ import random
+ import time
++from collections import defaultdict
+ from collections.abc import Mapping
+ from dataclasses import dataclass, field
+ from typing import Any
+@@ -51,6 +52,14 @@ class ProxyRouter:
+ 
+     def select_server(self, model: str, rollout_id: str) -> Model:
+         servers = _models.get(model, {})
++        if not servers and len(_models) == 1:
++            # The trainer registers its endpoints under actor_rollout_ref.model.path, which changes
++            # every time training restarts from a merged checkpoint; the server's configured
++            # model_name is fixed at launch. With exactly one registered model there is no
++            # ambiguity, so route to it (and let the body carry that server's name, which is what
++            # vLLM serves under) instead of answering 503 for the whole batch (docs §46).
++            (model_registered, servers), = _models.items()
++            log.warning("Routing to the only registered model", configured=model, registered=model_registered)
+         if not servers:
+             raise NoServersError(model)
+         # Stable ordering pins each rollout to one endpoint for prefix-cache reuse.
+@@ -59,21 +68,25 @@ class ProxyRouter:
+         index = int.from_bytes(digest[:8], "big") % len(pool)
+         return pool[index]
+ 
+-    def prepare_body(self, body: dict[str, Any], mode: str) -> dict[str, Any]:
++    def prepare_body(self, body: dict[str, Any], mode: str, model_name: str | None = None) -> dict[str, Any]:
++        model_name = model_name or self._model_name
+         if mode == "train":
+             prepared = {
+                 **body,
+-                "model": self._model_name,
++                "model": model_name,
+                 "temperature": self._train_temperature,
+                 "return_token_ids": True,
+             }
+             if self._include_log_probs:
++                # logprobs 里的 token 字段变成 "token_id:<id>" 字面量,于是 response
++                # 的 token id 是服务端真值,不必再用 tokenizer 重建(见 docs §41.5)。
+                 prepared["logprobs"] = True
++                prepared["return_tokens_as_token_ids"] = True
+             return prepared
+         if mode == "val":
+             prepared = {
+                 **body,
+-                "model": self._model_name,
++                "model": model_name,
+                 "temperature": self._val_temperature,
+                 "return_token_ids": True,
+             }
+@@ -126,6 +139,8 @@ async def forward_request(
+         response_body = (
+             response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+         )
++        if isinstance(response_body, dict):
++            _fill_missing_token_ids(request_body=body, response_body=response_body, model_name=server.model)
+ 
+         _capture_event(
+             rollout_id=rollout_id,
+@@ -200,6 +215,315 @@ def _retry_delay_seconds(attempt_index: int) -> float:
+     return delay * random.uniform(0.75, 1.25)
+ 
+ 
++_TOKENIZERS: dict[str, Any] = {}
++
++
++def _assistant_text(choice: dict[str, Any]) -> str:
++    """Reconstructed assistant text — approximate, and only a fallback.
++
++    The tool parser strips the tool-call block out of ``content``, so returning
++    ``content`` alone drops the action and keeps just the ``<think>`` prefix
++    (docs §41.3b: 59 tokens became 17). Concatenate instead of choosing. The
++    exact ids come from the logprobs path; this runs only when that is absent.
++    """
++    message = choice.get("message")
++    if not isinstance(message, dict):
++        return ""
++    parts: list[str] = []
++    content = message.get("content")
++    if isinstance(content, str) and content:
++        parts.append(content)
++    else:
++        reasoning = message.get("reasoning_content") or message.get("reasoning")
++        if isinstance(reasoning, str) and reasoning:
++            parts.append(reasoning)
++    tool_calls = message.get("tool_calls")
++    if tool_calls:
++        parts.append(_render_tool_calls_xml(tool_calls))
++    return "\n".join(parts)
++
++
++def _render_tool_calls_xml(tool_calls: Any) -> str:
++    """Render tool_calls back into the surface form MiniCPM5 actually emits.
++
++    The chat template writes assistant tool calls as
++    ``<function name="f"><param name="k">v</param></function>`` (chat_template.jinja
++    :135-148), and the parser reads that same shape back
++    (minicpm5xml_tool_parser.py:315). Dumping JSON here would put text in the
++    trajectory that the model never produced. Falls back to JSON only if the
++    structure is not what we expect.
++    """
++    try:
++        blocks: list[str] = []
++        for call in tool_calls:
++            fn = call.get("function", call) if isinstance(call, dict) else None
++            if not isinstance(fn, dict):
++                raise ValueError("tool_call has no function object")
++            name = fn["name"]
++            raw_args = fn.get("arguments", "")
++            args = json.loads(raw_args) if isinstance(raw_args, str) and raw_args else raw_args
++            if not isinstance(args, dict):
++                raise ValueError("arguments is not an object")
++            body = []
++            for key, value in args.items():
++                text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
++                # Same CDATA rule as the template, so the round trip matches.
++                if isinstance(value, str) and ("<" in value or "&" in value or "\n" in value):
++                    text = f"<![CDATA[{text}]]>"
++                body.append(f'<param name="{key}">{text}</param>')
++            blocks.append(f'<function name="{name}">' + "".join(body) + "</function>")
++        return "\n".join(blocks)
++    except Exception:
++        _bump("tool_call_xml_render_failed")
++        return json.dumps(tool_calls, ensure_ascii=False)
++
++
++_TOKEN_ID_PREFIX = "token_id:"
++
++# Every degraded branch below used to be silent. 92% of turns died in one of them
++# and nothing counted it (docs §41.4). Counting is what makes them visible.
++_CAPTURE_STATS: dict[str, int] = defaultdict(int)
++
++
++def capture_stats() -> dict[str, int]:
++    """Snapshot of the degradation counters, for the trainer's pre-flight check."""
++    return dict(_CAPTURE_STATS)
++
++
++def _bump(branch: str, **fields: Any) -> None:
++    _CAPTURE_STATS[branch] += 1
++    count = _CAPTURE_STATS[branch]
++    if count <= 3 or count % 200 == 0:
++        log.warning("token-id capture degraded", branch=branch, count=count, **fields)
++
++
++def _response_ids_from_logprobs(choice: dict[str, Any]) -> list[int] | None:
++    """Exact sampled ids, courtesy of ``return_tokens_as_token_ids``.
++
++    vLLM writes each token as the literal ``token_id:<id>`` (serving_engine.py:535).
++    Bail out wholesale on the first token that is not in that form — a partially
++    decoded list would be worse than falling back to the tokenizer.
++    """
++    logprobs = choice.get("logprobs")
++    if not isinstance(logprobs, dict):
++        return None
++    items = logprobs.get("content")
++    if not isinstance(items, list) or not items:
++        return None
++    ids: list[int] = []
++    for item in items:
++        token = item.get("token") if isinstance(item, dict) else None
++        if not isinstance(token, str) or not token.startswith(_TOKEN_ID_PREFIX):
++            return None
++        try:
++            ids.append(int(token[len(_TOKEN_ID_PREFIX) :]))
++        except ValueError:
++            return None
++    return ids
++
++
++def _check_against_usage(response_body: dict[str, Any], prompt_ids: list[int], response_ids: list[int]) -> None:
++    """vLLM already told us both lengths for free; disagreeing with it is a bug.
++
++    This is the check that would have caught §41.3b on day one — the stub kept
++    17 of the 59 tokens the server reported.
++    """
++    usage = response_body.get("usage")
++    if not isinstance(usage, dict):
++        return
++    for name, ids, key in (
++        ("prompt", prompt_ids, "prompt_tokens"),
++        ("response", response_ids, "completion_tokens"),
++    ):
++        expected = usage.get(key)
++        if not isinstance(expected, int) or expected <= 0 or not ids:
++            continue
++        # A couple of tokens of slack for special-token bookkeeping; a real
++        # mismatch (a dropped tool call, a rebuilt template) is far larger.
++        if abs(len(ids) - expected) > max(2, expected // 20):
++            _bump(f"{name}_length_mismatch", got=len(ids), expected=expected)
++
++
++def _fill_missing_token_ids(*, request_body: dict[str, Any], response_body: dict[str, Any], model_name: str) -> None:
++    """vLLM 0.8.x ignores return_token_ids; GRPO still needs prompt/response ids."""
++    choices = response_body.get("choices")
++    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
++        return
++    prompt_ids = response_body.get("prompt_token_ids") or choices[0].get("prompt_token_ids") or []
++    response_ids = choices[0].get("token_ids") or []
++
++    # Prefer the server's own ids: no chat template, so neither the tool-call
++    # template crash (§41.3) nor the stripped-content truncation (§41.3b) applies.
++    if not response_ids:
++        exact = _response_ids_from_logprobs(choices[0])
++        if exact:
++            response_ids = exact
++            choices[0]["token_ids"] = exact
++        else:
++            _bump("no_token_ids_in_logprobs")
++
++    if prompt_ids and response_ids:
++        _check_against_usage(response_body, prompt_ids, response_ids)
++        return
++
++    try:
++        filled_prompt, filled_response, strategy = _tokenize_chat(model_name, request_body, choices[0])
++    except Exception as exc:
++        _bump("tokenize_failed", error=str(exc))
++        log.warning("token-id backfill failed", model=model_name, error=str(exc))
++        return
++    if strategy != "as-is":
++        _bump(f"tokenize_via_{strategy}")
++    if not prompt_ids:
++        prompt_ids = filled_prompt
++        response_body["prompt_token_ids"] = filled_prompt
++    if not response_ids:
++        response_ids = filled_response
++        choices[0]["token_ids"] = filled_response
++    _check_against_usage(response_body, prompt_ids, response_ids)
++    log.info(
++        "token-id backfill",
++        model=model_name,
++        strategy=strategy,
++        prompt_tokens=len(prompt_ids),
++        response_tokens=len(response_ids),
++    )
++
++
++def _to_int_ids(raw: Any) -> list[int]:
++    if hasattr(raw, "tolist"):
++        raw = raw.tolist()
++    if not isinstance(raw, list):
++        raise TypeError(f"tokenizer returned {type(raw).__name__}, expected list[int]")
++    return [int(x) for x in raw]
++
++
++def _tokenize_chat(
++    model_name: str, request_body: dict[str, Any], choice: dict[str, Any]
++) -> tuple[list[int], list[int], str]:
++    tokenizer = _TOKENIZERS.get(model_name)
++    if tokenizer is None:
++        from transformers import AutoTokenizer
++
++        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
++        _TOKENIZERS[model_name] = tokenizer
++    messages = request_body.get("messages") or []
++    tools = request_body.get("tools")
++    # extra_body keys land at the top level of the request body, so this is where
++    # the client's chat_template_kwargs arrive.
++    prompt_ids, strategy = _apply_chat_template(
++        tokenizer, messages, tools, request_body.get("chat_template_kwargs")
++    )
++    response_ids = tokenizer.encode(_assistant_text(choice), add_special_tokens=False)
++    return prompt_ids, _to_int_ids(response_ids), strategy
++
++
++def _coerce_tool_call_arguments(messages: list[Any]) -> list[Any]:
++    """Turn ``function.arguments`` from a JSON string into a mapping.
++
++    The wire format specifies a string, but MiniCPM5's template calls
++    ``.items()`` on it, so every message carrying a prior tool call raises
++    ``UndefinedError`` and the whole turn is dropped (docs §41.3).
++    """
++    out: list[Any] = []
++    changed = False
++    for message in messages:
++        calls = message.get("tool_calls") if isinstance(message, dict) else None
++        if not calls:
++            out.append(message)
++            continue
++        new_calls: list[Any] = []
++        for call in calls:
++            function = call.get("function") if isinstance(call, dict) else None
++            arguments = function.get("arguments") if isinstance(function, dict) else None
++            if isinstance(arguments, str):
++                try:
++                    parsed = json.loads(arguments)
++                except (json.JSONDecodeError, TypeError):
++                    parsed = None
++                if isinstance(parsed, dict):
++                    call = {**call, "function": {**function, "arguments": parsed}}
++                    changed = True
++            new_calls.append(call)
++        out.append({**message, "tool_calls": new_calls})
++    return out if changed else messages
++
++
++def _inline_tool_calls(messages: list[Any]) -> list[Any]:
++    """Last resort: render tool calls into the text and drop the structured field.
++
++    A truncated generation leaves ``arguments`` as unparseable JSON, so coercing
++    it is not an option and the template still crashes on it. The rendered prompt
++    is then only an approximation of what the server saw — the usage cross-check
++    flags that — but an approximate turn beats a dropped one.
++    """
++    out: list[Any] = []
++    changed = False
++    for message in messages:
++        calls = message.get("tool_calls") if isinstance(message, dict) else None
++        if not calls:
++            out.append(message)
++            continue
++        text = message.get("content")
++        rendered = json.dumps(calls, ensure_ascii=False, default=str)
++        merged = f"{text}\n{rendered}" if isinstance(text, str) and text else rendered
++        out.append({k: v for k, v in message.items() if k != "tool_calls"} | {"content": merged})
++        changed = True
++    return out if changed else messages
++
++
++def _apply_chat_template(
++    tokenizer: Any, messages: list[Any], tools: Any, template_kwargs: Any = None
++) -> tuple[list[int], str]:
++    """As-is, then with coerced arguments, then without tools.
++
++    Templates fail with whatever their jinja happens to raise (``TypeError``,
++    ``UndefinedError``, ...), so each rung catches broadly and the last one
++    re-raises rather than returning a silently empty prompt.
++
++    ``template_kwargs`` is the request's own ``chat_template_kwargs``. It has to be
++    forwarded: the prompt we render here is what the *trainer* learns on, while the
++    prompt the policy actually generated from was rendered by vLLM **with** those
++    kwargs. Dropping them makes the two renders differ, and for MiniCPM5 the
++    difference is 4 tokens -- ``enable_thinking=False`` makes the template emit
++    ``<think>\\n\\n</think>\\n\\n`` at the generation position (chat_template.jinja:168).
++    Those 4 tokens broke the turn-to-turn prefix chain in
++    ``rollout_adapter.py:756``, so every turn of every episode was flushed as its own
++    training row carrying the episode-final reward: multi-turn credit assignment never
++    ran once across s1/s2/s3. Measured 10-05: n_unmerged_rollouts 64/64 every step,
++    22.1M forward tokens instead of 1.2M (18.3x). See docs/pitfalls-and-lessons.md §56.
++    """
++    base: dict[str, Any] = {"tokenize": True, "add_generation_prompt": True}
++    if isinstance(template_kwargs, dict) and template_kwargs:
++        base.update(template_kwargs)
++    with_tools = dict(base)
++    if tools:
++        with_tools["tools"] = tools
++
++    attempts: list[tuple[str, list[Any], dict[str, Any]]] = [("as-is", messages, with_tools)]
++    coerced = _coerce_tool_call_arguments(messages)
++    if coerced is not messages:
++        attempts.append(("args_dict", coerced, dict(with_tools)))
++    attempts.append(("no_tools", coerced, base))
++    inlined = _inline_tool_calls(coerced)
++    if inlined is not coerced:
++        attempts.append(("inlined_tool_calls", inlined, dict(with_tools)))
++        attempts.append(("inlined_no_tools", inlined, base))
++
++    last_error: Exception | None = None
++    for strategy, msgs, kwargs in attempts:
++        try:
++            prompt_ids = tokenizer.apply_chat_template(msgs, **kwargs)
++        except Exception as exc:
++            last_error = exc
++            continue
++        if isinstance(prompt_ids, str):
++            prompt_ids = tokenizer.encode(prompt_ids, add_special_tokens=False)
++        return _to_int_ids(prompt_ids), strategy
++    assert last_error is not None
++    raise last_error
++
++
+ async def _dec_inflight(pause_state: ProxyPauseState) -> None:
+     async with pause_state.lock:
+         pause_state.inflight = max(0, pause_state.inflight - 1)
+diff --git a/agentlightning/server/routes/proxy.py b/agentlightning/server/routes/proxy.py
+index 4ca2fab..54d8ff4 100644
+--- a/agentlightning/server/routes/proxy.py
++++ b/agentlightning/server/routes/proxy.py
+@@ -64,7 +64,7 @@ async def llm_proxy(rollout_id: str, attempt_id: str, mode: str, upstream_path:
+     except NoServersError:
+         raise HTTPException(status_code=503, detail=f"No servers available for model '{model_name}'") from None
+ 
+-    prepared_body = proxy_router.prepare_body(body, mode)
++    prepared_body = proxy_router.prepare_body(body, mode, model_name=server.model)
+ 
+     # Server endpoint includes the OpenAI base path (e.g., "http://vllm:8000/v1").
+     return await forward_request(
+diff --git a/agentlightning/verl/agl_rollout_manager.py b/agentlightning/verl/agl_rollout_manager.py
+index 7094592..4cd9d12 100644
+--- a/agentlightning/verl/agl_rollout_manager.py
++++ b/agentlightning/verl/agl_rollout_manager.py
+@@ -5,6 +5,7 @@
+ from __future__ import annotations
+ 
+ import json  # [multimodal-patch]
++import os
+ import time
+ import traceback
+ import uuid
+@@ -92,6 +93,34 @@ class _TraceEvent:
+     data: dict[str, Any]
+ 
+ 
++@dataclass
++class CaptureTally:
++    """How many of the agent's LLM calls actually became training triplets.
++
++    Kept per manager instance and reported per batch. Without it the drop below
++    is invisible: a run where 92% of the turns never reach the batch looks
++    exactly like a healthy one from the trainer's side (docs §41).
++    """
++
++    calls: int = 0
++    kept: int = 0
++    dropped_error: int = 0
++    dropped_no_token_ids: int = 0
++
++    @property
++    def rate(self) -> float:
++        return self.kept / self.calls if self.calls else 0.0
++
++    def reset(self) -> None:
++        self.calls = self.kept = self.dropped_error = self.dropped_no_token_ids = 0
++
++    def __str__(self) -> str:
++        return (
++            f"capture_rate={self.rate:.1%} ({self.kept}/{self.calls} calls) "
++            f"dropped_error={self.dropped_error} dropped_no_token_ids={self.dropped_no_token_ids}"
++        )
++
++
+ class _TraceEventHelper:
+     """Queues hook events before HTTP flush."""
+ 
+@@ -246,6 +275,17 @@ def _aligned_image_urls(raw_events: list[Event], n_triplets: int) -> list[list[s
+ class AglRolloutManagerBase:
+     """Base manager for Agent Lightning rollout HTTP operations."""
+ 
++    # Declared on the class, not assigned in ``__init__``: the test stubs stand
++    # a manager up without running its constructor, and counting capture must
++    # not be what breaks them.
++    _capture: CaptureTally | None = None
++
++    def _capture_tally(self) -> CaptureTally:
++        tally = self._capture
++        if tally is None:
++            tally = self._capture = CaptureTally()
++        return tally
++
+     def __init__(
+         self,
+         *,
+@@ -282,6 +322,39 @@ class AglRolloutManagerBase:
+             transport=RetryTransport(retry=Retry(total=10, allowed_methods=["GET"])),
+         )
+ 
++    def _report_capture(self, label: str) -> None:
++        """Print this batch's capture rate, and stop the run if it is too low.
++
++        ``AGL_MIN_CAPTURE_RATE`` is unset by default, so this only warns; set it
++        (e.g. ``0.9``) for a smoke run that should refuse to train on a batch
++        that is mostly missing.
++        """
++        tally = self._capture
++        if tally is None or not tally.calls:
++            # Every rollout finished without a single model_request event: the agents never
++            # reached the model (e.g. the gateway answered 503 "No servers available" because
++            # the registered model name did not match). Training on this batch would be
++            # training on nothing, so fail loudly with the actual cause instead of AttributeError.
++            raise RuntimeError(
++                f"{label}: no LLM calls were captured in this batch — the agents never reached "
++                "the model server. Check the agl-server log for 503/502 on /proxy/rollout/... "
++                "(model name registered by the trainer vs default_proxy.model_name) before retrying."
++            )
++        print(f"{label}: {tally}")
++        raw = os.environ.get("AGL_MIN_CAPTURE_RATE")
++        threshold = float(raw) if raw else 0.0
++        if tally.rate < max(threshold, 0.9):
++            print(
++                f"{label}: WARNING capture rate {tally.rate:.1%} — "
++                f"{tally.calls - tally.kept} of {tally.calls} LLM calls never reached the batch"
++            )
++        if threshold and tally.rate < threshold:
++            raise RuntimeError(
++                f"capture rate {tally.rate:.1%} is below AGL_MIN_CAPTURE_RATE={threshold:.1%} "
++                f"({tally.kept}/{tally.calls} calls kept, {tally.dropped_no_token_ids} lacked token ids). "
++                "Training on this batch would optimize over data that is mostly missing."
++            )
++
+     def register_model(self, server_addresses: list[str]) -> list[Model]:
+         """Register model server endpoints."""
+         models: list[Model] = []
+@@ -456,10 +529,14 @@ class AglRolloutManagerBase:
+             data = event.data
+             http_status = data.get("http_status")
+             response_token_ids = data.get("response_token_ids", [])
++            self._capture_tally().calls += 1
+             if data.get("status") == "error" or (isinstance(http_status, int) and http_status >= 400):
++                self._capture_tally().dropped_error += 1
+                 continue
+             if not response_token_ids:
++                self._capture_tally().dropped_no_token_ids += 1
+                 continue
++            self._capture_tally().kept += 1
+             triplets.append(
+                 Triplet(
+                     prompt={"token_ids": data.get("prompt_token_ids", [])},
+@@ -564,6 +641,7 @@ class AglRolloutManager(AglRolloutManagerBase):
+         for completed_rollout in completed_rollouts[num_deleted:]:
+             self._delete_rollout(completed_rollout.rollout_id)
+ 
++        self._report_capture("AglRolloutManager")
+         return completed_rollouts
+ 
+ 
+@@ -653,11 +731,13 @@ class AglAsyncRolloutManager(AglRolloutManagerBase):
+             if data_id not in completed_group_keys
+             for enqueued_rollout in group
+         ]
++        self._report_capture("AglAsyncRolloutManager")
+         return completed_rollouts, new_carry_over_rollouts
+ 
+ 
+ __all__ = [
+     "AglAsyncRolloutManager",
++    "CaptureTally",
+     "AglRolloutManager",
+     "AglRolloutManagerBase",
+     "CompletedRollout",
+diff --git a/agentlightning/verl/rollout_adapter.py b/agentlightning/verl/rollout_adapter.py
+index acb1322..0db0149 100644
+--- a/agentlightning/verl/rollout_adapter.py
++++ b/agentlightning/verl/rollout_adapter.py
+@@ -7,7 +7,10 @@ from __future__ import annotations
+ import base64  # [multimodal-patch]
+ import io
+ import json
++import os
++import random
+ import zipfile
++from pathlib import Path
+ from typing import Any, cast
+ 
+ import numpy as np
+@@ -18,8 +21,11 @@ from verl import DataProto
+ from agentlightning.verl.agl_rollout_manager import CompletedRollout
+ 
+ _TRACE_MERGE_MISMATCH_WANDB_LIMIT = 100
++# The wandb table stays capped; the local jsonl keeps everything.
++_TRACE_MERGE_MISMATCH_COLLECT_LIMIT = 2000
+ _TRACE_MERGE_MISMATCH_TEXT_LIMIT = 4000
+ _ROLLOUT_TRAJECTORY_WANDB_LIMIT = 24
++_SWANLAB_SAMPLE_TEXT_LIMIT = 12000
+ _TRACE_MERGE_MISMATCH_COLUMNS = [
+     "global_steps",
+     "rollout_id",
+@@ -34,6 +40,10 @@ _TRACE_MERGE_MISMATCH_COLUMNS = [
+     "current_trace_length",
+     "previous_trace",
+     "current_trace",
++    "diverge_index",
++    "diverge_kind",
++    "expected_window",
++    "actual_window",
+ ]
+ _ROLLOUT_TRAJECTORY_COLUMNS = [
+     "global_steps",
+@@ -47,6 +57,40 @@ def ids_startswith(full_ids: list[int], prefix_ids: list[int]) -> bool:
+     return full_ids[: len(prefix_ids)] == prefix_ids
+ 
+ 
++def text_level_continuation(
++    tokenizer: Any | None, prompt_ids: list[int], context_ids: list[int]
++) -> list[int] | None:
++    """Observation tokens when ``prompt_ids`` continues ``context_ids`` in *text*.
++
++    ``ids_startswith`` compares token ids, but the two streams are tokenized
++    differently by construction: ``context_ids`` is the server's prompt plus the
++    tokens it sampled one at a time, while ``prompt_ids`` is the whole
++    conversation re-tokenized in one pass.  At the seam where a response ends and
++    the next observation begins, ``tokenize(a + b) != tokenize(a) + tokenize(b)``,
++    so an unchanged conversation can still fail the id-level test.
++
++    Comparing decoded text instead is exact for that case.  The residual text is
++    re-encoded here rather than sliced out of ``prompt_ids``, because the text
++    boundary need not fall on one of its token boundaries.
++
++    Returns None when the conversation genuinely diverged (the caller must then
++    cut a new group), or when there is no tokenizer to decode with.
++    """
++    if tokenizer is None:
++        return None
++    try:
++        prompt_text = _decode_token_ids(tokenizer, prompt_ids)
++        context_text = _decode_token_ids(tokenizer, context_ids)
++        if not prompt_text.startswith(context_text):
++            return None
++        residual = prompt_text[len(context_text) :]
++        if not residual:
++            return []
++        return list(tokenizer.encode(residual, add_special_tokens=False))
++    except Exception:
++        return None
++
++
+ def _decode_token_ids(tokenizer: Any | None, ids: list[int]) -> str:
+     if tokenizer is not None:
+         try:
+@@ -95,10 +139,27 @@ def _build_compact_rollout_trajectory_records(
+         if not rollout.triplets:
+             continue
+         last_triplet = rollout.triplets[-1]
++        resp_tokens = sum(len(_token_ids(t.response)) for t in rollout.triplets)
++        prompt_tokens = len(_token_ids(last_triplet.prompt))
++        run_s = (
++            rollout.finished_at - rollout.running_at
++            if rollout.finished_at is not None and rollout.running_at is not None
++            else None
++        )
++        total_s = (
++            rollout.finished_at - rollout.enqueue_time
++            if rollout.finished_at is not None and rollout.enqueue_time is not None
++            else None
++        )
+         records.append(
+             {
+                 "rollout_id": rollout.rollout_id,
+                 "reward": rollout.final_reward if rollout.final_reward is not None else reward_fillna_value,
++                "n_turns": len(rollout.triplets),
++                "resp_tokens": resp_tokens,
++                "prompt_tokens": prompt_tokens,
++                "duration_s": round(run_s, 1) if run_s is not None else None,
++                "total_s": round(total_s, 1) if total_s is not None else None,
+                 "prompt": _decode_token_ids(tokenizer, _token_ids(last_triplet.prompt)),
+                 "response": _decode_token_ids(tokenizer, _token_ids(last_triplet.response)),
+             }
+@@ -114,6 +175,42 @@ def _build_zipped_jsonl(records: list[dict[str, Any]], jsonl_name: str) -> bytes
+     return buffer.getvalue()
+ 
+ 
++def _diverge_report(tokenizer: Any | None, expected: list[int], actual: list[int], window: int = 60) -> dict[str, Any]:
++    """Where the two token streams first disagree, plus a decoded window each side.
++
++    ``previous_trace``/``current_trace`` are truncated from the head, but a merge
++    break happens at the *end* of the previous context, so those fields never show
++    it. This does.
++    """
++    limit = min(len(expected), len(actual))
++    index = 0
++    while index < limit and expected[index] == actual[index]:
++        index += 1
++    lo = max(0, index - window)
++    return {
++        "diverge_index": index,
++        "expected_len": len(expected),
++        "actual_len": len(actual),
++        "diverge_kind": "ran_out" if index == limit else "token_differs",
++        "expected_window": _decode_token_ids(tokenizer, expected[lo : index + window]),
++        "actual_window": _decode_token_ids(tokenizer, actual[lo : index + window]),
++    }
++
++
++def _save_trace_merge_mismatches_locally(rows: list[dict[str, Any]], global_steps: int) -> Path | None:
++    """The wandb table is capped at 100 rows and wandb is often off; this is the
++    durable copy used to diagnose why turns fail to merge into one trajectory."""
++    root = os.environ.get("AGL_TRAJ_DIR") or os.environ.get("AGL_CKPT_DIR")
++    if not root or not rows:
++        return None
++    path = Path(root) / "trajectories" / f"step_{global_steps}_merge_mismatch.jsonl"
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with path.open("w", encoding="utf-8") as handle:
++        for row in rows:
++            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
++    return path
++
++
+ def _upload_trace_merge_mismatches_to_wandb(rows: list[dict[str, Any]], global_steps: int) -> None:
+     try:
+         import wandb
+@@ -121,13 +218,144 @@ def _upload_trace_merge_mismatches_to_wandb(rows: list[dict[str, Any]], global_s
+         if wandb.run is None:
+             return
+         table = wandb.Table(columns=cast(list[str | int], _TRACE_MERGE_MISMATCH_COLUMNS))
+-        for row in rows:
++        for row in rows[:_TRACE_MERGE_MISMATCH_WANDB_LIMIT]:
+             table.add_data(*(row.get(column) for column in _TRACE_MERGE_MISMATCH_COLUMNS))
+         wandb.log({"training/trace_merge_mismatches": table}, step=global_steps)
+     except Exception as exc:
+         print(f"Warning: failed to upload trace merge mismatches to wandb: {exc}")
+ 
+ 
++def _save_rollout_trajectories_locally(
++    records: list[dict[str, Any]],
++    global_steps: int,
++    *,
++    is_validation: bool = False,
++) -> Path | None:
++    """Write every compact trajectory row to disk. WandB/SwanLab tables are capped."""
++    root = os.environ.get("AGL_TRAJ_DIR") or os.environ.get("AGL_CKPT_DIR")
++    if not root:
++        return None
++    split = "validation" if is_validation else "train"
++    path = Path(root) / "trajectories" / f"step_{global_steps}_{split}.jsonl"
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with path.open("w", encoding="utf-8") as handle:
++        for record in records:
++            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
++    try:
++        import swanlab
++
++        swanlab.log({f"{split}/trajectory_rows": len(records)}, step=global_steps)
++    except Exception:
++        # swanlab is optional; the jsonl file is the durable trajectory log.
++        pass
++    return path
++
++
++def _clip_swanlab_text(text: str) -> str:
++    if len(text) <= _SWANLAB_SAMPLE_TEXT_LIMIT:
++        return text
++    omitted = len(text) - _SWANLAB_SAMPLE_TEXT_LIMIT
++    return text[:_SWANLAB_SAMPLE_TEXT_LIMIT] + f"\n...[truncated {omitted} chars]"
++
++
++def _log_rollout_step_metrics_to_swanlab(
++    records: list[dict[str, Any]],
++    global_steps: int,
++    *,
++    is_validation: bool = False,
++) -> None:
++    """Log per-step aggregate rollout metrics (duration/turns/tokens/reward) as SwanLab scalars."""
++    if not records:
++        return
++    split = "validation" if is_validation else "train"
++    p = f"{split}/rollout"
++    rewards = [float(r.get("reward", 0.0)) for r in records]
++    durations = [float(r["duration_s"]) for r in records if r.get("duration_s") is not None]
++    totals = [float(r["total_s"]) for r in records if r.get("total_s") is not None]
++    turns = [int(r.get("n_turns", 0)) for r in records]
++    resp_tokens = [int(r.get("resp_tokens", 0)) for r in records]
++    n = len(records)
++    n_resolved = sum(1 for x in rewards if x >= 1.0)
++    n_timeout = sum(1 for x in rewards if x < 0.0)
++
++    def _pctl(values: list[float], q: float) -> float:
++        srt = sorted(values)
++        idx = min(len(srt) - 1, max(0, int(round((len(srt) - 1) * q))))
++        return float(srt[idx])
++
++    payload: dict[str, Any] = {
++        f"{p}_count": n,
++        f"{p}_reward_mean": sum(rewards) / n,
++        f"{p}_n_resolved": n_resolved,
++        f"{p}_resolve_rate": n_resolved / n,
++        f"{p}_n_timeout": n_timeout,
++        f"{p}_turns_mean": sum(turns) / n,
++        f"{p}_turns_max": max(turns) if turns else 0,
++        f"{p}_resp_tokens_mean": sum(resp_tokens) / n,
++        f"{p}_resp_tokens_max": max(resp_tokens) if resp_tokens else 0,
++    }
++    if durations:
++        payload[f"{p}_dur_s_mean"] = sum(durations) / len(durations)
++        payload[f"{p}_dur_s_p50"] = _pctl(durations, 0.5)
++        payload[f"{p}_dur_s_p90"] = _pctl(durations, 0.9)
++        payload[f"{p}_dur_s_max"] = max(durations)
++    if totals:
++        payload[f"{p}_total_s_max"] = max(totals)
++    try:
++        import swanlab
++
++        swanlab.log(payload, step=global_steps)
++    except Exception as exc:
++        print(f"Warning: failed to log {split} rollout step metrics to swanlab: {exc}")
++
++
++def _log_random_rollout_sample_to_swanlab(
++    records: list[dict[str, Any]],
++    global_steps: int,
++    *,
++    is_validation: bool = False,
++) -> None:
++    """Log one sampled rollout's full text to SwanLab, throttled to every Nth train step."""
++    if not records:
++        return
++    split = "validation" if is_validation else "train"
++    if not is_validation:
++        try:
++            every = int(os.environ.get("AGL_SWANLAB_SAMPLE_EVERY", "5") or "5")
++        except ValueError:
++            every = 5
++        if every > 1 and global_steps != 1 and global_steps % every != 0:
++            return
++    sample = random.choice(records)
++    prefix = f"{split}/sample"
++    header = (
++        f"rollout_id={sample.get('rollout_id', '')} "
++        f"reward={sample.get('reward', 0.0)} "
++        f"n_turns={sample.get('n_turns', '?')} "
++        f"resp_tokens={sample.get('resp_tokens', '?')} "
++        f"duration_s={sample.get('duration_s', '?')}\n\n"
++    )
++    prompt = _clip_swanlab_text(header + str(sample.get("prompt", "")))
++    response = _clip_swanlab_text(header + str(sample.get("response", "")))
++    try:
++        import swanlab
++
++        payload: dict[str, Any] = {
++            f"{prefix}_reward": float(sample.get("reward", 0.0)),
++            f"{prefix}_prompt_chars": len(str(sample.get("prompt", ""))),
++            f"{prefix}_response_chars": len(str(sample.get("response", ""))),
++        }
++        try:
++            payload[f"{prefix}_prompt"] = swanlab.Text(prompt)
++            payload[f"{prefix}_response"] = swanlab.Text(response)
++        except Exception:
++            payload[f"{prefix}_prompt"] = prompt
++            payload[f"{prefix}_response"] = response
++        swanlab.log(payload, step=global_steps)
++    except Exception as exc:
++        print(f"Warning: failed to log random {split} rollout sample to swanlab: {exc}")
++
++
+ def _upload_compact_rollout_trajectories_to_wandb(
+     records: list[dict[str, Any]],
+     global_steps: int,
+@@ -413,6 +641,9 @@ class RolloutAdapter:
+         n_trunc_sample_because_of_response = 0
+         n_skipped_empty_training_rows = 0
+         unmerged_count = 0
++        n_text_level_merges = 0
++        n_budget_splits = 0
++        n_budget_splits_blocked = 0
+         response_len_per_turn_list: list[int] = []
+         merge_mismatch_rows: list[dict[str, Any]] = []
+ 
+@@ -523,8 +754,51 @@ class RolloutAdapter:
+                     next_context = prompt_ids + response_ids
+ 
+                     if ids_startswith(prompt_ids, current_context):
+-                        if len(prompt_ids) > len(current_context):
+-                            observation_ids = prompt_ids[len(current_context) :]
++                        observation_ids: list[int] | None = prompt_ids[len(current_context) :]
++                    else:
++                        # Differing ids do not imply a differing conversation: the
++                        # two streams are tokenized differently by construction.
++                        # Check the text before cutting the trajectory in two.
++                        observation_ids = text_level_continuation(
++                            self.tokenizer, prompt_ids, current_context
++                        )
++                        if observation_ids is not None:
++                            n_text_level_merges += 1
++
++                    if observation_ids is not None:
++                        # The group is one training row, and a row's response is
++                        # sliced to max_response_length.  Merging past the slot
++                        # would not "split" anything -- it would throw the tail
++                        # (the reward-earning last turns) away.  So when the next
++                        # turn no longer fits, close the row here and open a new
++                        # one at this turn, whose prompt is the full context so
++                        # far.  Same tokens, same conditionals, one more row.
++                        projected = len(current_response_ids) + len(observation_ids) + len(response_ids)
++                        if projected > self.max_response_length:
++                            if len(prompt_ids) <= self.max_prompt_length:
++                                append_training_row(
++                                    rollout_id=rollout.rollout_id,
++                                    data_id=rollout.data_id,
++                                    turn_index=group_start_turn_index,
++                                    prompt_ids=current_prompt_ids,
++                                    response_ids=current_response_ids,
++                                    reward=final_reward,
++                                    response_mask=current_response_mask,
++                                    response_log_probs=current_response_log_probs,
++                                )
++                                n_budget_splits += 1
++                                group_start_turn_index = turn_index
++                                current_context = next_context
++                                current_prompt_ids = list(prompt_ids)
++                                current_response_ids = list(response_ids)
++                                current_response_mask = [1] * len(response_ids)
++                                current_response_log_probs = list(log_probs) if log_probs is not None else None
++                                continue
++                            # The prompt slot cannot hold this turn's context
++                            # either, so a new row would be dropped whole.
++                            # Merge on and let the slice happen; count it.
++                            n_budget_splits_blocked += 1
++                        if observation_ids:
+                             current_response_ids += observation_ids
+                             current_response_mask += [0] * len(observation_ids)
+                             if current_response_log_probs is not None:
+@@ -539,9 +813,10 @@ class RolloutAdapter:
+                         current_context = next_context
+                         continue
+ 
+-                    if len(merge_mismatch_rows) < _TRACE_MERGE_MISMATCH_WANDB_LIMIT:
++                    if len(merge_mismatch_rows) < _TRACE_MERGE_MISMATCH_COLLECT_LIMIT:
+                         merge_mismatch_rows.append(
+                             {
++                                **_diverge_report(self.tokenizer, current_context, prompt_ids),
+                                 "global_steps": global_steps,
+                                 "rollout_id": rollout.rollout_id,
+                                 "data_id": rollout.data_id,
+@@ -593,14 +868,20 @@ class RolloutAdapter:
+                 if merged_group_count > 1:
+                     unmerged_count += 1
+ 
+-        rollout_trajectory_records = _build_compact_rollout_trajectory_records(
++        all_rollout_trajectory_records = _build_compact_rollout_trajectory_records(
+             sorted_rollouts,
+             tokenizer=self.tokenizer,
+             reward_fillna_value=self.reward_fillna_value,
+-            limit=_ROLLOUT_TRAJECTORY_WANDB_LIMIT,
+         )
++        _save_rollout_trajectories_locally(all_rollout_trajectory_records, global_steps)
++        _log_rollout_step_metrics_to_swanlab(all_rollout_trajectory_records, global_steps)
++        _log_random_rollout_sample_to_swanlab(all_rollout_trajectory_records, global_steps)
++        _save_trace_merge_mismatches_locally(merge_mismatch_rows, global_steps)
+         _upload_trace_merge_mismatches_to_wandb(merge_mismatch_rows, global_steps)
+-        _upload_compact_rollout_trajectories_to_wandb(rollout_trajectory_records, global_steps)
++        _upload_compact_rollout_trajectories_to_wandb(
++            all_rollout_trajectory_records[:_ROLLOUT_TRAJECTORY_WANDB_LIMIT],
++            global_steps,
++        )
+ 
+         n_sample = len(input_ids_list)
+         if n_sample == 0:
+@@ -768,6 +1049,7 @@ class RolloutAdapter:
+             "training/n_rollouts_w_reward": sample_with_reward_count,
+             "training/n_truncated_sample": n_trunc_sample_because_of_response,
+             "training/n_skipped_empty_rows": n_skipped_empty_training_rows,
++            "training/n_text_level_merges": n_text_level_merges,
+             "training/n_turns": n_response_turns,
+             "response_length/training/avg_by_turn": float(np.mean(response_len_per_turn_list)),
+             "response_length/training/max_by_turn": int(np.max(response_len_per_turn_list)),
+@@ -776,6 +1058,8 @@ class RolloutAdapter:
+         if level == "trajectory":
+             data_metrics["training/n_unmerged_rollouts"] = unmerged_count
+             data_metrics["training/n_trace_merge_mismatch_rows"] = len(merge_mismatch_rows)
++            data_metrics["training/n_budget_splits"] = n_budget_splits
++            data_metrics["training/n_budget_splits_blocked"] = n_budget_splits_blocked
+ 
+         return data_proto, data_metrics
+ 
+@@ -809,6 +1093,21 @@ class RolloutAdapter:
+             tokenizer=self.tokenizer,
+             reward_fillna_value=self.reward_fillna_value,
+         )
++        _save_rollout_trajectories_locally(
++            validation_trajectory_records,
++            global_steps,
++            is_validation=True,
++        )
++        _log_rollout_step_metrics_to_swanlab(
++            validation_trajectory_records,
++            global_steps,
++            is_validation=True,
++        )
++        _log_random_rollout_sample_to_swanlab(
++            validation_trajectory_records,
++            global_steps,
++            is_validation=True,
++        )
+         _upload_compact_rollout_trajectories_to_wandb(
+             validation_trajectory_records,
+             global_steps,
+diff --git a/agentlightning/verl/trainer.py b/agentlightning/verl/trainer.py
+index 57575e7..ad79da2 100644
+--- a/agentlightning/verl/trainer.py
++++ b/agentlightning/verl/trainer.py
+@@ -6,7 +6,9 @@ from __future__ import annotations
+ 
+ import asyncio
+ import logging
++import os
+ import random
++import shutil
+ import time
+ import uuid
+ from collections import defaultdict
+@@ -51,6 +53,41 @@ log = logging.getLogger(__name__)
+ RolloutManagerT = TypeVar("RolloutManagerT", bound=AglRolloutManagerBase)
+ 
+ 
++def _atomic_replace_dir(tmp_dir: str, final_dir: str) -> None:
++    """Publish a finished checkpoint directory by renaming `*.tmp` over the live path."""
++    old_dir = final_dir + ".old"
++    if os.path.exists(old_dir):
++        shutil.rmtree(old_dir)
++    if os.path.exists(final_dir):
++        os.rename(final_dir, old_dir)
++    os.replace(tmp_dir, final_dir)
++    if os.path.exists(old_dir):
++        shutil.rmtree(old_dir)
++
++
++def _atomic_write_text(path: str, text: str) -> None:
++    tmp_path = path + ".tmp"
++    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
++    with os.fdopen(fd, "w", encoding="utf-8") as handle:
++        handle.write(text)
++        handle.flush()
++        os.fsync(handle.fileno())
++    os.replace(tmp_path, path)
++
++
++def _prune_old_step_dirs(ckpt_root: str, keep_step: int) -> None:
++    keep_name = f"global_step_{keep_step}"
++    if not os.path.isdir(ckpt_root):
++        return
++    for name in os.listdir(ckpt_root):
++        path = os.path.join(ckpt_root, name)
++        if name.endswith(".tmp") or name.endswith(".old"):
++            shutil.rmtree(path, ignore_errors=True)
++            continue
++        if name.startswith("global_step_") and name != keep_name:
++            shutil.rmtree(path, ignore_errors=True)
++
++
+ def _batch_dict_len(batch: dict[str, Any] | None) -> int:
+     """Leading-dim length of a dataloader batch dict (0 if absent/empty)."""
+     if batch is None or not batch:
+@@ -93,6 +130,80 @@ def _same_reward_uid_indices(batch: DataProto) -> list[int]:
+     return same_reward_indices
+ 
+ 
++def _split_zero_adv_groups(batch: DataProto) -> tuple[list[int], int, int]:
++    """Indices of rows whose GRPO group has reward variance, plus group counts.
++
++    A group (same ``uid``) whose rollouts all scored the same has zero
++    advantage everywhere, so its rows contribute nothing but a KL term to
++    the gradient (DAPO "dynamic sampling").  Returns
++    ``(keep_indices, n_groups, n_zero_adv_groups)``.
++    """
++    n = len(batch)
++    if n == 0 or "uid" not in batch.non_tensor_batch:
++        return list(range(n)), 0, 0
++    same = set(_same_reward_uid_indices(batch))
++    n_groups = len(set(batch.non_tensor_batch["uid"].tolist()))
++    keep = [i for i in range(n) if i not in same]
++    n_valid_groups = len({batch.non_tensor_batch["uid"][i] for i in keep})
++    return keep, n_groups, n_groups - n_valid_groups
++
++
++_ADDITIVE_METRIC_PREFIXES = ("training/n_",)
++
++
++def _merge_round_metrics(acc: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
++    """Merge per-round agent metrics: ``training/n_*`` counts add up, the rest keep the latest round."""
++    for key, value in new.items():
++        if key.startswith(_ADDITIVE_METRIC_PREFIXES) and isinstance(value, (int, float)) and key in acc:
++            acc[key] = acc[key] + value
++        else:
++            acc[key] = value
++    return acc
++
++
++def _mini_batch_fit(n_transition: int, mini_bs: int, max_ppo_update_times: int | None) -> tuple[int, int]:
++    """How many rows to drop and how many to pad so the batch is a mini-batch multiple.
++
++    Every row is generated data, so the remainder below the next multiple is
++    padded up rather than dropped.  Dropping happens only when the update cap
++    says the batch is too big.
++    """
++    if n_transition == 0:
++        return 0, 0
++    n_target = -(-n_transition // mini_bs) * mini_bs
++    if max_ppo_update_times is not None:
++        n_target = min(n_target, mini_bs * max_ppo_update_times)
++    return max(0, n_transition - n_target), max(0, n_target - n_transition)
++
++
++def _shuffle_rows(batch: DataProto) -> DataProto:
++    """Return the batch with its rows in a uniformly random order (tensor + non-tensor)."""
++    n = len(batch)
++    if n <= 1:
++        return batch
++    perm = torch.randperm(n)
++    batch.reorder(perm)
++    return batch
++
++
++def _pad_with_neutral_duplicates(batch: DataProto, n_to_pad: int) -> DataProto:
++    """Append copies of random rows that the policy gradient cannot see.
++
++    A pad row is a rollout of its own (fresh rollout_id) in a GRPO group of its
++    own (fresh uid) with a zero score: rollout-level advantage sees a one-row
++    rollout, GRPO sees a singleton group with mean 0, and the advantage comes
++    out exactly 0.  Its source rollout and group are untouched.  It still
++    costs a forward pass, which is the price of not throwing rows away.
++    """
++    sources = [random.randrange(len(batch)) for _ in range(n_to_pad)]
++    pad = batch[sources]  # pyright: ignore[reportAssignmentType]
++    pad.batch["token_level_scores"] = torch.zeros_like(pad.batch["token_level_scores"])
++    pad.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(n_to_pad)], dtype=object)
++    if "rollout_id_list" in pad.non_tensor_batch:
++        pad.non_tensor_batch["rollout_id_list"] = np.array([f"pad-{uuid.uuid4().hex}" for _ in range(n_to_pad)])
++    return DataProto.concat([batch, pad])
++
++
+ class AgentLightningRayPPOTrainer(RayPPOTrainer):
+     """RayPPOTrainer that drives train and validation rollouts via Agent Lightning."""
+ 
+@@ -112,6 +223,61 @@ class AgentLightningRayPPOTrainer(RayPPOTrainer):
+         self._carry_over_rollouts: list[EnqueuedRollout] = []
+         self._train_dataloader_iter: Any | None = None
+ 
++    def _save_checkpoint(self):
++        """Write `global_step_N.tmp`, then rename over the live directory.
++
++        A crash during the worker save leaves the previous `global_step_*` and
++        tracker untouched. `max_actor_ckpt_to_keep=1` is enough because the
++        old directory is only removed after the rename succeeds.
++        """
++        from verl.utils.fs import local_mkdir_safe
++
++        try:
++            from verl.trainer.ppo.utils import Role
++        except ImportError:
++            from verl.trainer.ppo.ray_trainer import Role
++
++        ckpt_root = self.config.trainer.default_local_dir
++        step_name = f"global_step_{self.global_steps}"
++        final_folder = os.path.join(ckpt_root, step_name)
++        tmp_folder = final_folder + ".tmp"
++        if os.path.exists(tmp_folder):
++            shutil.rmtree(tmp_folder)
++        local_mkdir_safe(tmp_folder)
++
++        print(f"local_global_step_folder (tmp): {tmp_folder}")
++        actor_local_path = os.path.join(tmp_folder, "actor")
++        actor_remote_path = (
++            None
++            if self.config.trainer.default_hdfs_dir is None
++            else os.path.join(self.config.trainer.default_hdfs_dir, step_name, "actor")
++        )
++        self.actor_rollout_wg.save_checkpoint(
++            actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=None
++        )
++
++        if self.use_critic:
++            critic_local_path = os.path.join(tmp_folder, str(Role.Critic))
++            critic_remote_path = (
++                None
++                if self.config.trainer.default_hdfs_dir is None
++                else os.path.join(self.config.trainer.default_hdfs_dir, step_name, str(Role.Critic))
++            )
++            self.critic_wg.save_checkpoint(
++                critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=None
++            )
++
++        dataloader_local_path = os.path.join(tmp_folder, "data.pt")
++        dataloader_state_dict = self.train_dataloader.state_dict()
++        torch.save(dataloader_state_dict, dataloader_local_path)
++
++        _atomic_replace_dir(tmp_folder, final_folder)
++        _prune_old_step_dirs(ckpt_root, self.global_steps)
++        _atomic_write_text(
++            os.path.join(ckpt_root, "latest_checkpointed_iteration.txt"),
++            str(self.global_steps),
++        )
++
+     def _ensure_hooks(self) -> RolloutHooks | None:
+         if self._hooks is not None:
+             return self._hooks
+@@ -442,6 +608,117 @@ class AgentLightningRayPPOTrainer(RayPPOTrainer):
+             print("AgentLightningRayPPOTrainer: residual vLLM requests aborted.")
+         return out, metrics
+ 
++    def _dynamic_sampling_config(self) -> tuple[bool, int, int]:
++        """``(enabled, max_gen_batches, min_valid_groups)`` from ``agentlightning.dynamic_sampling``.
++
++        Disabled when the block is missing or ``enabled`` is false.  ``min_valid_groups``
++        defaults to ``data.train_batch_size`` (DAPO: keep sampling until a full batch
++        of groups carries gradient).  ``max_gen_batches`` bounds the extra rollout
++        rounds; the step trains on whatever it has once the bound is hit.
++        """
++        cfg = self.config.agentlightning.get("dynamic_sampling", None)
++        if not cfg or not cfg.get("enabled", False):
++            return False, 1, 0
++        max_gen_batches = int(cfg.get("max_gen_batches", 1))
++        if max_gen_batches < 1:
++            raise ValueError(f"agentlightning.dynamic_sampling.max_gen_batches must be >= 1, got {max_gen_batches}")
++        min_valid_groups = cfg.get("min_valid_groups", None)
++        if min_valid_groups is None:
++            min_valid_groups = self.config.data.train_batch_size
++        min_valid_groups = int(min_valid_groups)
++        if min_valid_groups < 1:
++            raise ValueError(f"agentlightning.dynamic_sampling.min_valid_groups must be >= 1, got {min_valid_groups}")
++        if self.is_async:
++            raise ValueError("agentlightning.dynamic_sampling is only supported with async_rollout.enabled=false")
++        return True, max_gen_batches, min_valid_groups
++
++    def _rollout_one_round(self, curr_step_profile: bool) -> tuple[DataProto, dict[str, Any]]:
++        """Draw the next train batch, roll it out, and tag every row with its GRPO group ``uid``."""
++        batch_dict = self._next_train_batch_dict_for_rollout()
++        batch: DataProto = DataProto.from_single_dict(batch_dict)
++        gen_batch = self._get_gen_batch(batch)
++        gen_batch.meta_info["global_steps"] = self.global_steps
++        # verl 0.8.0 moved rollout profiling behind llm_server_manager.
++        has_llm_server_manager = hasattr(self, "llm_server_manager")
++
++        if curr_step_profile:
++            if has_llm_server_manager:
++                self.llm_server_manager.start_profile()  # pyright: ignore[reportAttributeAccessIssue]
++            else:
++                self.async_rollout_manager.start_profile()  # pyright: ignore[reportAttributeAccessIssue]
++        gen_batch_output, agent_metrics = self._rollout(gen_batch, is_train=True)
++        if curr_step_profile:
++            if has_llm_server_manager:
++                self.llm_server_manager.stop_profile()  # pyright: ignore[reportAttributeAccessIssue]
++            else:
++                self.async_rollout_manager.stop_profile()  # pyright: ignore[reportAttributeAccessIssue]
++
++        out = gen_batch_output
++        if "data_id_list" in out.non_tensor_batch:
++            out.non_tensor_batch["uid"] = out.non_tensor_batch["data_id_list"]
++        else:
++            out.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(out.batch))], dtype=object)
++        return out, agent_metrics
++
++    def _collect_train_batch(self, metrics: dict[str, Any], curr_step_profile: bool) -> DataProto | None:
++        """Roll out until enough GRPO groups have reward variance (DAPO dynamic sampling).
++
++        With ``agentlightning.dynamic_sampling.enabled=false`` this is exactly one
++        rollout round and every row is kept.  When enabled, rows of groups whose
++        rollouts all got the same reward are discarded (they have zero advantage
++        and would only burn old_log_prob/ref/actor compute), and further rounds
++        are drawn until ``min_valid_groups`` groups survive or ``max_gen_batches``
++        rounds have been spent.  Returns ``None`` when nothing survives.
++        """
++        enabled, max_gen_batches, min_valid_groups = self._dynamic_sampling_config()
++        kept_parts: list[DataProto] = []
++        agent_metrics: dict[str, Any] = {}
++        n_rounds = 0
++        n_rows_seen = 0
++        n_rows_discarded = 0
++        n_groups_seen = 0
++        n_groups_zero_adv = 0
++        n_groups_valid = 0
++
++        while True:
++            n_rounds += 1
++            round_batch, round_metrics = self._rollout_one_round(curr_step_profile)
++            agent_metrics = _merge_round_metrics(agent_metrics, round_metrics)
++            n_rows_seen += len(round_batch)
++            if enabled:
++                keep, n_groups, n_zero = _split_zero_adv_groups(round_batch)
++                n_groups_seen += n_groups
++                n_groups_zero_adv += n_zero
++                n_groups_valid += n_groups - n_zero
++                n_rows_discarded += len(round_batch) - len(keep)
++                if keep:
++                    kept_parts.append(round_batch[keep] if len(keep) < len(round_batch) else round_batch)
++                print(
++                    f"AgentLightningRayPPOTrainer: dynamic sampling round {n_rounds}/{max_gen_batches}: "
++                    f"{n_groups - n_zero}/{n_groups} groups with reward variance, "
++                    f"{len(keep)}/{len(round_batch)} rows kept; valid groups so far {n_groups_valid}/{min_valid_groups}"
++                )
++                if n_groups_valid >= min_valid_groups or n_rounds >= max_gen_batches:
++                    break
++            else:
++                kept_parts.append(round_batch)
++                break
++
++        metrics.update(agent_metrics)
++        metrics["training/dynamic_sampling/enabled"] = int(enabled)
++        metrics["training/dynamic_sampling/gen_rounds"] = n_rounds
++        metrics["training/dynamic_sampling/n_rows_seen"] = n_rows_seen
++        metrics["training/dynamic_sampling/n_rows_discarded_zero_adv"] = n_rows_discarded
++        metrics["training/dynamic_sampling/n_groups_seen"] = n_groups_seen
++        metrics["training/dynamic_sampling/n_groups_zero_adv"] = n_groups_zero_adv
++        metrics["training/dynamic_sampling/n_groups_valid"] = n_groups_valid
++
++        if not kept_parts:
++            return None
++        if len(kept_parts) == 1:
++            return kept_parts[0]
++        return DataProto.concat(kept_parts)
++
+     def _train_step(
+         self,
+         timing_raw: dict[str, float],
+@@ -452,41 +729,17 @@ class AgentLightningRayPPOTrainer(RayPPOTrainer):
+         metrics["timing/step_start_wall"] = self._step_start_wall
+         rollout_n = self.config.actor_rollout_ref.rollout.n
+ 
+-        batch_dict = self._next_train_batch_dict_for_rollout()
+-
+-        batch: DataProto = DataProto.from_single_dict(batch_dict)
+-
+-        gen_batch = self._get_gen_batch(batch)
+-        gen_batch.meta_info["global_steps"] = self.global_steps
+-        # verl 0.8.0 moved rollout profiling behind llm_server_manager.
+-        has_llm_server_manager = hasattr(self, "llm_server_manager")
++        if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
++            raise NotImplementedError("REMAX baseline not yet supported in AgentLightningRayPPOTrainer")
+ 
+         with marked_timer("gen", timing_raw, color="red"):
+-            if curr_step_profile:
+-                if has_llm_server_manager:
+-                    self.llm_server_manager.start_profile()  # pyright: ignore[reportAttributeAccessIssue]
+-                else:
+-                    self.async_rollout_manager.start_profile()  # pyright: ignore[reportAttributeAccessIssue]
+-
+-            gen_batch_output, agent_metrics = self._rollout(gen_batch, is_train=True)
+-            if curr_step_profile:
+-                if has_llm_server_manager:
+-                    self.llm_server_manager.stop_profile()  # pyright: ignore[reportAttributeAccessIssue]
+-                else:
+-                    self.async_rollout_manager.stop_profile()  # pyright: ignore[reportAttributeAccessIssue]
+-            metrics.update(agent_metrics)
++            batch = self._collect_train_batch(metrics, curr_step_profile)
+         metrics["timing/rollout_phase_end_wall"] = time.time()
++        if batch is None:
++            print("WARNING: dynamic sampling found no group with reward variance; skipping this training step.")
++            return None
+ 
+-        if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+-            raise NotImplementedError("REMAX baseline not yet supported in AgentLightningRayPPOTrainer")
+-
+-        batch = gen_batch_output
+         batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+-        if "data_id_list" in batch.non_tensor_batch:
+-            batch.non_tensor_batch["uid"] = batch.non_tensor_batch["data_id_list"]
+-        else:
+-            batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
+-
+         if "response_mask" not in batch.batch:
+             batch.batch["response_mask"] = compute_response_mask(batch)
+ 
+@@ -502,11 +755,7 @@ class AgentLightningRayPPOTrainer(RayPPOTrainer):
+         mini_bs = self.config.actor_rollout_ref.actor.ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+         n_transition = len(batch)
+         max_ppo_update_times = self.config.agentlightning.get("max_ppo_update_times", None)
+-        n_remained_transition = n_transition // mini_bs * mini_bs
+-        if max_ppo_update_times is not None:
+-            n_remained_transition = min(n_remained_transition, mini_bs * max_ppo_update_times)
+-
+-        n_to_drop = n_transition - n_remained_transition
++        n_to_drop, n_to_pad = _mini_batch_fit(n_transition, mini_bs, max_ppo_update_times)
+         n_dropped_same_reward = 0
+         n_dropped_random = 0
+         if n_to_drop > 0:
+@@ -529,12 +778,25 @@ class AgentLightningRayPPOTrainer(RayPPOTrainer):
+             drop_indices = same_reward_drop_set | set(random_drop_indices)
+             keep_indices = [sample_idx for sample_idx in range(n_transition) if sample_idx not in drop_indices]
+             batch = batch[keep_indices]  # pyright: ignore[reportAssignmentType]
++        if n_to_pad > 0:
++            batch = _pad_with_neutral_duplicates(batch, n_to_pad)
+         metrics["training/n_sample_dropped/same_reward"] = n_dropped_same_reward
+         metrics["training/n_sample_dropped/random"] = n_dropped_random
+-        metrics["training/n_sample_trained"] = len(batch)
++        metrics["training/n_sample_padded"] = n_to_pad
++        metrics["training/n_sample_trained"] = len(batch) - n_to_pad
+         if len(batch) == 0:
+-            print("WARNING: no trainable batch after drop+floor; skipping this training step.")
++            print("WARNING: no trainable batch after drop; skipping this training step.")
+             return None
++        # Rows arrive grouped by rollout (and, with dynamic sampling, by round), and the
++        # legacy dp_actor path splits mini-batches in order without shuffling, so the last
++        # rollouts of every step were always trained by the most-drifted policy.  A
++        # permutation spreads that importance-ratio drift evenly across rollouts.  It runs
++        # before _balance_batch, which keeps the relative order inside each dp partition.
++        if self.config.agentlightning.get("shuffle_train_rows", True):
++            batch = _shuffle_rows(batch)
++            metrics["training/rows_shuffled"] = 1
++        else:
++            metrics["training/rows_shuffled"] = 0
+ 
+         print("AgentLightningRayPPOTrainer: sleeping rollout replicas.")
+         self.checkpoint_manager.sleep_replicas()  # pyright: ignore[reportOptionalMemberAccess]
+@@ -622,7 +884,9 @@ class AgentLightningRayPPOTrainer(RayPPOTrainer):
+                 batch.batch["advantages"],
+                 batch.batch["response_mask"],
+                 rollout_ids,
+-                num_trained_rows=len(batch),
++                # Pads carry zero advantage; they must not shrink the 1/N scale
++                # of the rows that do train.
++                num_trained_rows=len(batch) - n_to_pad,
+             )
+ 
+         if self.use_critic:

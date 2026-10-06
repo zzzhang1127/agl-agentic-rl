@@ -1,0 +1,156 @@
+# 官方 smith harness(mini-swe-agent 形态)的 rollout Job —— 2026-10-02 新开的 s1 血统。
+#
+# 和 job-template-openai.yaml(官方原版)的四处区别,都是本机实际情况逼出来的:
+#   1. 镜像用 {{ input.image_name }} 而不是 ...~":openai"。本机 132 个 SWE-smith 镜像全是
+#      :latest,没有一个 :openai 变体;为了 import 一个类去 build 132 个镜像不值得,
+#      pod 里又没网装不了 pip。改为 smith_agent.py 自带 stdlib urllib 兜底客户端
+#      (_StdlibOpenAI,和跑完 474 题评测的 smith_rollout.py 是同一套代码)。
+#   2. configMap 用已有的 swe-smith-opencode-scripts(里面本来就有 smith_agent.py);
+#      官方写的 swe-smith-agent-scripts 在本集群不存在,挂不上会卡 ContainerCreating。
+#   3. PATH 显式指到 /opt/miniconda3/envs/testbed/bin —— 镜像默认 PATH 下没有 python
+#      (run_smith_sweep.py:228 评测侧同样处理)。
+#   4. 长度惩罚的阈值按比例缩放到我们的预算,见下面每条注释。官方默认值在我们的
+#      max_turns=40 / 51200 窗口下**一次都不会触发**(t0=80 > 40;soft_start=50000 >
+#      prompt 天花板 47104),等于没开。
+#
+# 口径与 val-474 基线(基座 123/474)对齐:turns 40、obs cap 6000、单命令 120s、评测 600s。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ job_name }}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: agl-rollout
+    spec:
+      restartPolicy: Never
+      # 见 k3s_unlatch.sh 头部的根因:节点会被 kubelet 的 evictionMinimumReclaim(k3s
+      # 默认 10%)误闩在 DiskPressure=True 上,带 node.kubernetes.io/disk-pressure:NoSchedule
+      # 污点,把 rollout pod 全挡成 Pending —— 10-02 实测这么闩了整 8 天。
+      # 根治靠 k3s_unlatch.sh(重启 kubelet 清掉内存里的 m.thresholdsMet,5 秒见效);
+      # 下面两条是安全带,保证闩锁万一半路出现、看护脚本还没轮到时 rollout 不中断:
+      #   - toleration:闩着也调度得上去;
+      #   - system-node-critical:priority 2000001000 >= 2e9 → IsCriticalPod 为真 →
+      #     eviction_manager.go:616 "cannot evict a critical pod"。少了这条,
+      #     光有 toleration 反而更糟:pod 调度上去会被每 10 秒一轮的驱逐循环秒杀。
+      #     自定义 PriorityClass 做不到(admission 限制用户值 <= 1e9),只能用内置这个;
+      #     本集群实测 default 命名空间允许(server dry-run 通过)。
+      tolerations:
+        - key: node.kubernetes.io/disk-pressure
+          operator: Exists
+          effect: NoSchedule
+      priorityClassName: system-node-critical
+      hostAliases:
+        - ip: "<LAN_IP>"
+          hostnames:
+            - "host.docker.internal"
+      containers:
+        - name: agent
+          image: {{ input.image_name | yaml_escape }}
+          command:
+            - bash
+            - -lc
+            - |
+              set -o pipefail
+              mkdir -p /agl-logs/new
+              export PATH=/opt/miniconda3/envs/testbed/bin:/opt/miniconda3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+              timeout 1500 python /agl/agents/smith_agent.py 2>&1 | tee /agl-logs/new/{{ job_name }}.log
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: AGL_TASK_INPUT
+              value: {{ input.problem_statement | yaml_escape }}
+            # 10-05(s4):**维持 40,不要砍**。我一度想砍到 34(训练 rollout 里 reward=1 的
+            # episode 轮数 p90=30、max=32),但当晚 val-474 实测把它否了:解出来的 127 条里
+            # 21 条(16.5%)用了 >34 轮,其中 18 条正好顶到 40。砍 34 省的是 ~11% 的 gen 时间,
+            # 赌掉的是一成多的成功样本 —— 不划算。训练/评测都用 40,口径也就天然对齐。
+            - name: SMITH_MAX_TURNS
+              value: "40"
+            - name: SMITH_CMD_TIMEOUT
+              value: "120"
+            - name: SMITH_EVAL_TIMEOUT
+              value: "600"
+            - name: SMITH_OBS_CHAR_CAP
+              value: "6000"
+            # 4096 和 max_model_len 51200 配成 prompt 天花板 47104(实测最大 45448)。
+            # **别和 s4 的 data.max_response_length=43008 搞混,那是两个东西**:
+            #   这里的 4096 = rollout 里**单轮**最多生成多少 token(客户端每次请求显式传);
+            #   43008   = 合并后**整条 episode** 当成一条训练行时 response 段的上限。
+            # verl 会把 max_response_length 写进 vLLM 的 override_generation_config.max_new_tokens
+            # (启动日志里能看到 43008),但那只是"请求没传 max_tokens 时的默认值";
+            # smith_agent 每次都显式传 AGL_MAX_TOKENS,所以单轮仍然是 4096。
+            # 真要改单轮上限就改这里,改 MAXRESP 不会影响单轮。
+            - name: AGL_MAX_TOKENS
+              value: "4096"
+            - name: SMITH_MAX_FORMAT_ERRORS
+              value: "3"
+            - name: SMITH_F2P_ONLY
+              value: "1"
+            # s3 起(10-05):训练奖励 = F2P 通过比例(稠密),不再是「全过才给分」。
+            # 只对 base_url 带 /mode/train/ 的 rollout 生效,**验证集永远走二值** ——
+            # 基座 123/474、SFT 136/474 都是二值口径,改了历史数字就没法比。
+            # 超时或破 P2P 时比例强制 0(agents/smith_agent.py evaluate()),所以
+            # ratio==1.0 当且仅当 resolved,轮数/膨胀惩罚的 solved 门控照旧有效。
+            # 实测(s1 的 5735 条 rollout):零方差组 40.4% → 30.3%,有梯度组 ×1.17,
+            # 四条全错的 416 组救回 145 个(34.9%)。P2P 保持二值硬闸:软化只能买回
+            # 1.4% 的梯度覆盖,代价是在 119 个组里教「破少点就行」。
+            - name: SMITH_F2P_PARTIAL
+              value: "1"
+            - name: SMITH_HIDDEN_GIT_DIR
+              value: "/opt/agl_tmp"
+            - name: SMITH_GATEWAY_WAIT_S
+              value: "600"
+            # 训练采样 temp 1.0(官方配方),但**验证**要 0.6 —— val-474 的基线
+            # (基座 123/474)全是 temp 0.6 测的,探针用训练温度就没法和它们比。
+            # smith_agent.main() 用 base_url 里的 /mode/train/ 判训练/验证,
+            # 验证时把这个值顶到 SMITH_TEMPERATURE 上。
+            - name: SMITH_VAL_TEMPERATURE
+              value: "0.6"
+            # --- 长度惩罚(官方机制,阈值按官方比例缩放) ---
+            # plan A 轮数惩罚:reward = 1 - λ·clip((n_turns-T0)/(max_turns-T0),0,1),
+            # 只打**训练集里做对了**的 rollout(agents/smith_agent.py:656-674),val 奖励不整形
+            # (它要用来选 ckpt)。官方 T0/max_turns = 80/100 = 0.8,照搬比例 → 0.8×40 = 32。
+            # 32 轮内做对保持 1.0,拖到 40 轮拿 0.9。
+            - name: SMITH_LEN_PEN_T0
+              value: "32"
+            - name: SMITH_LEN_PEN_LAMBDA
+              value: "0.1"
+            # plan B 上下文膨胀惩罚:官方 soft/hard = 50000/64000 对应它 65536 的轨迹预算
+            # (0.763 / 0.977)。同比例缩到 51200 → soft 39000;hard 直接取真实天花板 47104
+            # (= 51200 - 4096),这样斜坡在预算边缘刚好吃满 0.1,不会像取 50000 那样
+            # 永远达不到满额。实测 p99=38639 / max=45448,所以这项只打最胖的那 1%。
+            - name: SMITH_PROMPT_PEN_SOFT_START
+              value: "39000"
+            - name: SMITH_PROMPT_PEN_HARD_CAP
+              value: "47104"
+            - name: SMITH_PROMPT_PEN_MAX
+              value: "0.1"
+            - name: AGL_LOG_DIR
+              value: "/agl-logs/new"
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "8Gi"
+          volumeMounts:
+            - name: agent-scripts
+              mountPath: /agl/agents
+              readOnly: true
+            - name: rollout-logs
+              mountPath: /agl-logs
+      volumes:
+        - name: agent-scripts
+          configMap:
+            name: swe-smith-opencode-scripts
+            defaultMode: 0755
+        - name: rollout-logs
+          hostPath:
+            # 这一份模板被 restart_s1_/restart_s2_smith_trainer.sh 共用,而且是按字面路径
+            # 传给 AGL 的 k8s runner(agentlightning.k8s.job_template_path),没有任何替换机制 ——
+            # 所以写死某条血统的目录,对另一条血统就一定是错的(s2 的 pod 日志一直在往 s1 目录里写)。
+            # 改成与血统无关的目录,谁跑都对。s1 的历史日志留在原处不动。
+            path: /workspace/agl-checkpoints/smith_rollout_logs
+            type: DirectoryOrCreate

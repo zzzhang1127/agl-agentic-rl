@@ -1,0 +1,91 @@
+# OpenCode SWE-smith rollout Job. Uses the local SWE-smith image (same
+# /testbed as eval). OpenCode and rg are hostPath mounts, not baked in.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ job_name }}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: agl-rollout
+    spec:
+      restartPolicy: Never
+      hostAliases:
+        - ip: "<LAN_IP>"
+          hostnames:
+            - "host.docker.internal"
+      containers:
+        - name: agent
+          image: {{ input.image_name | yaml_escape }}
+          command:
+            - bash
+            - -lc
+            - |
+              set -o pipefail
+              mkdir -p /agl-logs/new
+              export PATH="/usr/local/bin:/opt/miniconda3/envs/testbed/bin:/opt/miniconda3/bin:$PATH"
+              "$(command -v python || command -v python3)" /agl/agents/opencode_agent.py 2>&1 | tee /agl-logs/new/{{ job_name }}.log
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: AGL_TASK_INPUT
+              value: {{ input.problem_statement | yaml_escape }}
+            - name: AGL_SAMPLE_TIMEOUT
+              value: "900"
+            - name: SMITH_EVAL_TIMEOUT
+              value: "600"
+            - name: AGL_MAX_TOKENS
+              value: "6144"
+            - name: AGL_OPENCODE_CONTEXT
+              value: "45056"
+            - name: AGL_OPENCODE_RESERVED
+              value: "16384"
+            - name: AGL_TOOL_CHAR_LIMIT
+              value: "16000"
+            - name: AGL_TOOL_COMBINED_CHAR_LIMIT
+              value: "32000"
+            - name: AGL_OPENCODE_BIN
+              value: "/usr/local/bin/opencode"
+            - name: AGL_LOG_DIR
+              value: "/agl-logs/new"
+            - name: SMITH_HIDDEN_GIT_DIR
+              value: "/opt/agl_tmp"
+            - name: SMITH_F2P_ONLY
+              value: "1"
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "8Gi"
+          volumeMounts:
+            - name: agent-scripts
+              mountPath: /agl/agents
+              readOnly: true
+            - name: rollout-logs
+              mountPath: /agl-logs
+            - name: opencode-bin
+              mountPath: /usr/local/bin/opencode
+              readOnly: true
+            - name: rg-bin
+              mountPath: /usr/local/bin/rg
+              readOnly: true
+      volumes:
+        - name: agent-scripts
+          configMap:
+            name: swe-smith-opencode-scripts
+            defaultMode: 0755
+        - name: rollout-logs
+          hostPath:
+            path: /workspace/agl-checkpoints/swe_smith_opencode/agl-logs
+            type: DirectoryOrCreate
+        - name: opencode-bin
+          hostPath:
+            path: /workspace/.local/bin/opencode
+            type: File
+        - name: rg-bin
+          hostPath:
+            path: /workspace/agl-tools/rg
+            type: File
