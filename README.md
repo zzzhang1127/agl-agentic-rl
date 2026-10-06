@@ -31,7 +31,7 @@ swe_smith/
   containers/     SWE-smith 任务镜像的规划与预拉
   opencode_lineage/  更早的 OpenCode-harness 血统（v2–v4）与它的教师流水线，已被 smith harness 取代
 patches/          对 agent-lightning 核心库的 diff（+1016/−49）、配套单测、verl dp_group 补丁
-docs/             踩坑与经验（§1–§66，按「现象 → 根因 → 解决 → 经验」写）、MiniCPM5-2B 选型与架构问答
+docs/             踩坑与经验（§1–§66，按「现象 → 根因 → 解决 → 经验」写）
 ```
 
 ## 方法概览
