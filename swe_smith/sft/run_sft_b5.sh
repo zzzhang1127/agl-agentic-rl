@@ -19,10 +19,13 @@ export SWANLAB_LOG_DIR=/workspace/agl-checkpoints/swanlog SWANLAB_MODE=cloud
 CKPT=${CKPT:-/workspace/agl-checkpoints/swe_smith_sft_b5}
 INIT=${INIT:-/workspace/models/MiniCPM5-2B-sft-v3-ep3}
 for f in $D/data_b5/train.parquet $D/data_b5/val.parquet $INIT/config.json; do [ -f $f ] || { echo "missing $f"; exit 1; }; done
-# refuse to start on busy cards (never fight the trainer / neighbours for memory)
+# refuse to start on busy cards (never fight the trainer / neighbours for memory).
+# Check FREE memory, not used: cards 1/3/5 permanently carry 20-46G of neighbours' processes
+# (10-06 patrol: card 1 has 52G free), and the s5 trainer itself runs within that. Same floor as
+# s5_cycle.sh's resume check (card 1 "空闲52239MiB OK").
 for g in ${CUDA_VISIBLE_DEVICES//,/ }; do
-  used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i $g)
-  [ "$used" -lt 8000 ] || { echo "GPU $g has ${used}MiB in use; refusing to start"; exit 1; }
+  free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i $g)
+  [ "$free" -ge ${MIN_FREE_MIB:-48000} ] || { echo "GPU $g has only ${free}MiB free; refusing to start"; exit 1; }
 done
 cd /workspace/projects/agent-lightning
 exec .venv/bin/torchrun --standalone --nnodes=1 --nproc_per_node=4 --master_port=${MASTER_PORT:-29519} \
@@ -39,5 +42,6 @@ exec .venv/bin/torchrun --standalone --nnodes=1 --nproc_per_node=4 --master_port
   optim.weight_decay=0.01 optim.clip_grad=1.0 optim.betas=[0.9,0.95] \
   trainer.total_epochs=${EPOCHS:-1} trainer.save_freq=after_each_epoch trainer.test_freq=after_each_epoch \
   trainer.max_ckpt_to_keep=1 trainer.resume_mode=disable \
+  'checkpoint.save_contents=[hf_model]' \
   trainer.project_name=swe_smith_sft trainer.experiment_name=sft_b5_from_ep3 \
   trainer.default_local_dir=$CKPT trainer.logger=[console,swanlab] trainer.n_gpus_per_node=4 trainer.seed=1

@@ -16,7 +16,7 @@
 | s3 | SFT ep3 | **F2P 通过比例（稠密）+ P2P 硬闸**，700 道筛过的题 | lr 回 2e-6 | step 5 坍塌 | 根因在反分词：vLLM `skip_special_tokens` 把模型原生工具调用的特殊 token 剥掉，残文回流对话，格式错烧光 40 轮；零方差组 41%→15% 证明稠密奖励本身有效 |
 | 合并修复 | — | — | 代理透传 `chat_template_kwargs`（89% 的合并失败）+ 模板按正文 `</think>` 重切（13.3% 的轮次） | — | 此前每条 episode 被打碎成「一轮一行」，前向浪费 18.3×；修后 `MAXRESP=43008`、`PPO_MINI=4`、40 轮不砍 |
 | s4 | SFT ep3 | s3 奖励 + **轮数罚**（T0=32，λ=0.1）+ 上下文罚 | 合并修复后首条 | step 10：145（p=0.185，不显著）→ step 20：**117（p=0.030，显著跌）**，停 | 轮数罚是组内**唯一**的稳定信号（同样做对的样本 t=−35），模型学到的是「早交卷」（提交率 71%）而不是「修 bug」 |
-| s5 | SFT ep3 | = s4 去掉轮数罚与上下文罚 | 其余逐字相同（pod 模板已核对） | step 10：132（p=0.90）；step 20 进行中 | 每 10 步全量探针，显著下降即停（`training/s5_cycle.sh`） |
+| s5 | SFT ep3 | = s4 去掉轮数罚与上下文罚 | 其余逐字相同（pod 模板已核对） | step 10：132（p=0.90）；step 20：135（p=1.00） | 每 10 步全量探针，显著下降即停（`training/s5_cycle.sh`）；两点平线，按「无效果就转蒸馏」暂停于 step 20（ckpt 可 resume） |
 
 基线说明：s4/s5 的对照基线是 SFT ep3 在当前模板下的重测 **134/474**；更早记录的 127 是旧模板读数，+7 题来自模板修复而不是 RL。
 
@@ -32,8 +32,8 @@
 
 - **教师**：deepseek-v4-flash，经 OpenAI 兼容代理（`distillation/teacher_proxy_smith.py`）接入官方 harness。代理做归一化：35% 的回合在 bash 块后拖伪 XML 结束标签、4% 幻觉续写下一步、1.2% content 为空（答案在 reasoning_content）、1.7% 原生 DSML 标记，归一化后格式错误率 4.5%→1.6%，有效命令零改动。
 - **拒绝采样**：只留 `resolved` 且已提交的轨迹；剪掉（格式错的 assistant 轮，`Format error:` 的 user 轮）对；assistant 归一化为 THOUGHT + 单 bash 块（`distillation/assemble_smith_teacher.py`）。
-- **批次**：b5 = 1000 道训练题，100 并发 47 分钟，822 resolved，清洗后留 707；b6 = 其余 5338 道训练题，150 并发，采集中。更早的 b1–b4 用的是 OpenCode harness 格式，不能复用（已重采）。验证集的教师轨迹只用来评测，不进 SFT。
-- **SFT**（`sft/`）：全参，4 卡 FSDP + Ulysses sp4，lr 1e-5，动态打包；`swe_sft_dataset.py` 渲染出的序列与推理时 vLLM 用的模板**逐字相同**（`enable_thinking=False`），loss 只盖 assistant 轮（占 23.4% token）。SFT ep3 来自 b1–b4 的 858 行、3 个 epoch 78 步；`run_sft_b5.sh` 从 ep3 续 1 epoch。
+- **批次**：b5 = 1000 道训练题，100 并发 47 分钟，822 resolved，清洗后留 707；b6 = 其余 5338 道训练题，150 并发 112 分钟，4336 resolved，清洗后留 3878（与 b5 零重叠；丢弃原因：未 resolved 1002、未提交 385、不可解析 48、截断 24）。更早的 b1–b4 用的是 OpenCode harness 格式，不能复用（已重采）。验证集的教师轨迹只用来评测，不进 SFT。
+- **SFT**（`sft/`）：全参，4 卡 FSDP + Ulysses sp4，lr 1e-5，动态打包；`swe_sft_dataset.py` 渲染出的序列与推理时 vLLM 用的模板**逐字相同**（`enable_thinking=False`），loss 只盖 assistant 轮（占 23.4% token）。SFT ep3 来自 b1–b4 的 858 行、3 个 epoch 78 步；`run_sft_b5.sh` 从 ep3 续 1 epoch（707 行、21 步、lr 5e-6）：474 题 **126 vs 134**，McNemar p=0.36，不显著（此题量的可检出下限约 16 题），训练 loss 0.46→0.44 基本没动；`run_sft_b6.sh` 从 b5 权重续 1 epoch（3848 行、约 121 步），评测待出。
 
 ## 评测 harness（`harness/`）
 

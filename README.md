@@ -11,8 +11,8 @@
 | 任务 | 模型 | 方法 | 基线 | 训练后 | 统计 | 口径与必须说明的事 |
 |---|---|---|---|---|---|---|
 | **GSM8K**（单轮） | Qwen2.5-1.5B-Instruct | 官方示例 GRPO，n=4，lr 1e-6 | 62.55%（825/1319） | **78.17%**（1031/1319，step 1550） | 两比例 z=8.78 | 全量 test 1319 题，精确匹配；**未开 KL**（官方默认 `use_kl_loss=False`）；step 1550 不是峰值（峰值在 800–1000 步附近，ckpt 被 `keep=2` 轮掉）；单轮 RLVR，不是多轮 agentic |
-| **SWE-smith**（多轮 coding agent） | MiniCPM5-2B（2.5B，Llama 架构） | 官方 smith harness + GRPO，五条血统 s1–s5 | 134/474 | s5 step 10：132/474（p=0.90）；step 20 进行中 | 无显著增益 | 固定 474 题验证集，temperature 0.6，真实上限 470（4 题的镜像任何模型都做不出）；此前四条血统要么平线要么坍塌，根因都已定位（见下） |
-| **SWE-smith 蒸馏** | 基座 → 教师轨迹 SFT | deepseek-v4-flash 轨迹，只留做对的题 | 基座 123/474 | SFT ep3 127/474（同一旧模板，差异不显著）；模板修复后重测 134 | — | 这是蒸馏口径，不是 RL 增益；第 5/6 批教师轨迹（官方 harness 格式）正在采，下一轮 SFT 待训 |
+| **SWE-smith**（多轮 coding agent） | MiniCPM5-2B（2.5B，Llama 架构） | 官方 smith harness + GRPO，五条血统 s1–s5 | 134/474 | s5 step 10：132/474（p=0.90）；step 20：135/474（p=1.00），暂停于 step 20 转蒸馏 | 无显著增益 | 固定 474 题验证集，temperature 0.6，真实上限 470（4 题的镜像任何模型都做不出）；此前四条血统要么平线要么坍塌，根因都已定位（见下） |
+| **SWE-smith 蒸馏** | 基座 → 教师轨迹 SFT | deepseek-v4-flash 轨迹，只留做对的题 | 基座 123/474 | SFT ep3 127/474（同一旧模板，差异不显著）；模板修复后重测 134；b5 续训 1 epoch 后 **126/474**（vs 134，McNemar p=0.36，噪声内） | — | 这是蒸馏口径，不是 RL 增益；第 5 批（707 条）续训无变化；第 6 批（全训练集 5338 题，教师做对 4336，清洗后 3878 条）已采完，从 b5 权重续训 1 epoch 进行中 |
 
 截至 2026-10-06。两条线的详细结果、血统表和根因见 [`gsm8k/README.md`](gsm8k/README.md) 与 [`swe_smith/README.md`](swe_smith/README.md)。
 
@@ -68,6 +68,6 @@ trainer 与 vLLM 推理共置在同一组 GPU 上，每步先 rollout 再更新�
 
 ## 之后会更新什么
 
-- s5 的后续探针结果；若仍无增益，转「教师轨迹 SFT（第 5/6 批，官方 harness 格式）→ 再 RL」的路线。
-- 蒸馏第 6 批（全训练集 5338 题）的采集结果与下一轮 SFT 的 474 题评测。
+- s5 两次探针平线后已暂停（step 20 的 ckpt 保留，可 resume），路线转为「教师轨迹 SFT（第 5/6 批，官方 harness 格式）→ 再 RL」。
+- 第 6 批 SFT（3848 行，从 b5 权重续 1 epoch）的 474 题评测；若显著上涨，下一条 RL 从它起。
 - `docs/pitfalls-and-lessons.md` 持续追加。
