@@ -3790,3 +3790,53 @@ MDE +18。判 CONTINUE_WARN:在噪声量级内,既不是增益也不构成「明
 8. `py_compile` 不查缺失 import:模块级 `re.compile` 在 `import re` 缺失时启动即 NameError,改完必须 import smoke。
 9. 训练日志里 `grep -oE 'step:[0-9]+'` 会抓到 `timing_s/step` 的值;要用 `'step:[0-9]+ -'`。
 10. 同一行里 `image_name` 自带 `jyangballin/` 前缀,拼镜像名时别再加一遍(第一次算出「0 个本地镜像」就是这个)。
+
+## §67 教师轨迹 SFT 两轮递减(134→126→118):损失全在「40 轮内没交卷」,学生学了教师的探索长度却学不到收敛(2026-10-06 21:10)
+
+**数字**:b5(ep3 续 1 epoch,677 行,21 步,700 万 token)474 题 126 vs 134,McNemar p=0.36;b6(b5 续 1 epoch,3848 行,120 步,3950 万 token,每步≈33 万 token)**118 vs 134,p=0.056**(both 95 / base_only 39 / b6_only 23,MDE +18)。两轮都判 CONTINUE_WARN,但方向一致向下,**按蒸馏口径不是增益**。对照:SFT ep3 本身是 858 行×3 epoch=5190 万 token 从基座训出来的(123→127/134)。
+
+**先排除运行层**:三轮 overflow 都是 0、timeout ≤1、status_error 0、`n_turns=None` 都是同 5 条(Go 镜像无 python)——不是评测事故。
+
+**逐题核对 result.json 的画像**(ep3 → b5 → b6):
+- submitted 240 → 205 → 164;未交卷里顶满 40 轮的 213 → 262 → 302(其余是 Go 镜像那几条);
+- resolved/submitted **55.8% → 61.5% → 72.0%**;交了卷的轮数中位 16 → 19 → 16。
+⇒ 损失**全部**来自「没交卷」,交了卷的反而更准。学生学到的是教师的行为分布:教师 b6 轨迹 assistant 轮数 p50 18、p90 31、12% ≥30 轮、只 34% ≤15 轮(都是做对了的轨迹,所以「长」在教师那里是「谨慎后做对」)。2B 学生模仿了「多探索再交」的前半段,却没有教师的收敛能力,于是更多题探索到 40 轮被掐。未交卷样本的 smith.log 尾部:grep/sed/写 repro 脚本失败再读,**不是死循环、不是格式错**,就是没走到提交。
+
+**还有一个没对齐的变量**:教师采样 `AGL_SAMPLE_TIMEOUT=2400`,评测是 600(人类 09-21 定死不提)。教师的长轨迹有些是 600 s 内根本跑不完的,学生学了也兑现不了。
+
+**经验**:
+1. 蒸馏没涨先看 **submitted 与 resolved/submitted 的分解**,比看总分有信息量得多:这里总分跌 16 题,但「交卷准确率」涨了 16 pp,两件事抵消后才是 −16。只看总分会误判成「数据脏」。
+2. 拒绝采样只筛「做对」不筛「怎么做对」:**轨迹长度本身是会被学走的监督信号**(这和 §62 的长度通道是同一件事的 SFT 版)。下一轮若再做,先改数据不加数据:按轮数筛短轨迹(≤15 轮占 34%,约 1300 条)、或把「剩余轮数」写进 prompt 让学生学会收尾;教师采样超时与评测对齐。
+3. 轮次规则(每轮新题续训 1 epoch)在这里连做两轮都是小步(loss 0.46→0.43),**递减是稳定的方向而不是噪声**——两次 CONTINUE_WARN 同向就该停,不等第三次。
+
+**同框架参照(人类令「同样的框架评 Qwen3-8B」)**:`smith_fleet.sh` 加了三个 env(`FLEET_SERVED_NAME`/`FLEET_CHAT_TEMPLATE=none`/`FLEET_ROPE_SCALING`),默认值逐字不变;Qwen3-8B 用 YaRN factor 2.0 把 40960 扩到 65536 容纳 ctx 51200,非思考模式(harness 本来就传 `enable_thinking=False`),采样参数沿用 MiniCPM 口径 temp 0.6/top_p 0.95/top_k 20(不是 Qwen 官方非思考推荐的 0.7/0.8)。冒烟核对 harness 对它工作正常:Qwen3 模板自己在 assistant 前缀塞 `<think>\n\n</think>`,回复是 THOUGHT + 单 bash 块,45k token 的 prompt 可接受。结果见本节末尾追加。
+
+**工程陷阱(本段新增)**:
+1. **vLLM V1 的 EngineCore 是独立子进程**,只杀 api_server 显存不放(残留 29.8G 让下一实例把 util 算到 0.958)。停实例:`kids=$(pgrep -P $P); kill $P $kids`。
+2. `cd … && nohup … &` 记下的 `$!` 是子壳 pid(python 真 pid +2),和 §66 陷阱 2 是同一件事的另一种写法。
+3. 合成长 prompt 估 token 要实测:文件清单一行 12 token,15000 行是 18 万 token 不是 4.5 万。
+4. 8B 模型的 KV 账:51200 token 一条 = 7.03 GiB;权重 15.3 G + 激活 2.5 G 后,budget 30000 只剩 9 万 token KV,45000 才够 8 并发;50000 会把常年有 46 G 邻居的卡挤出候选。
+
+**Qwen3-8B 终值(21:09–21:50,`val_qwen3_8b`)**:**22/474 = 4.6%**(vs ep3 134,McNemar p=0.0000;基线独对 114、Qwen3 独对 2)。交卷 87、顶满 40 轮 358、超时 8、溢出 10、resolved/submitted 18/87、交卷轮数中位 11、completion token 中位 19 799。日志画像是大量重复同一条命令直到 40 轮——这是没对齐采样参数和没做过这个协议的零样本表现,**只能作参照,不能用来说「8B 不如 2B」**:它说明官方 smith 协议(THOUGHT + 单 bash 块 + 自己判断何时提交)对没见过的模型并不自然,SFT ep3 的 134 里有相当一部分是「学会了协议」而非「学会了修 bug」。
+
+## §68 蒸馏三连跌之后:条件口径的选择偏差、短轨迹/LoRA 两条并行方案、`/` 满导致的段错误(2026-10-06 22:40)
+
+**人类的问题 1:「把指标限定为不超轮次情况下的正确率,蒸馏是否带来了提升?」** 按 result.json 配对算(双方都在 40 轮内交卷的子集):b5 vs ep3 87:82(只 b5 对 9/只 ep3 对 4,p=0.267);b6 vs ep3 78:70(只 b6 对 10/只 ep3 对 2,**p=0.039**);没顶满 40 轮子集的正确率 ep3 45.8% → b5 51.4% → b6 54.5%。看起来是涨,**但不能当提升报**:分母由模型自己的行为决定(选择偏差/碰撞偏差)。b6 在 ep3 原本做对的 60 题上放弃交卷(b5 45 题),新赢回的只有 21(b5 28)。条件正确率升的机理是「只交有把握的卷」,就像一个只答简单题的学生「答了的题正确率更高」。真实指标仍是无条件 474,而它在跌。**经验**:任何「限定在模型自己选出的子集上」的指标都要先问分母是谁定的;分母随模型变,指标就不可比。
+
+**人类的问题 2:「让 deepseek-v4-flash 审视 MiniCPM 的 rollout,判断哪个步骤对奖励有增益,让奖励信号更密集?」** 这是把序列级奖励换成判官给的轮级信号(process reward),直指 §61 定位的 credit-assignment 根因。先做离线试点再下结论:`swe_smith_smoke/judge_pilot/judge_pilot.py` 从 s5 轨迹抽 40 个混合组(同题既有做对又有做错)160 条 + 30 条复判,判官**盲评**(不告诉测试结果):预测成败、逐轮 P/N/H、首个致命轮。度量:盲预测 vs 真实 reward 的判别力(判官到底看不看得懂)、失败轨迹里致命轮之前的 token 占比(= 现在被整段压低的梯度份额)、复判一致率(信号噪声)。每条 prompt 中位 13.8k token、8 s;160 条 ≈2.3M token。**陷阱**:第一轮 `max_tokens=2000` 让 144/160 条被截断——flash 非思考模式会在正文里先写几百行分析再给 JSON,按 `{.*}` 正则只能抓到短轨迹的;改成「分析 ≤300 词 + 末尾 ```json 块」、上限 6000、取最后一个平衡 `{}`。第二轮仍 95/160 截断(输出中位正好 6000),`rerun_unparsed.py` 以 16000 补判后 123/160 可解析,剩下 37 条还是没给 JSON——全是 40 轮顶满的长轨迹(未解析组 n_turns 中位 40,已解析组 33),flash 写 16k token 分析也写不完。
+
+**判官试点结果(160 条全量)**:
+- 序列级:盲评准确率 0.852(TP 67 / FN 2 / FP 16 / TN 37,多数类基线 0.566),AUC 0.870,组内「做对排在做错前」62/77 = 0.805。偏差方向是**乐观**:16 个假阳性里判官信了 agent 自述「测试通过」——这就是用判官当奖励时的 hack 入口。
+- 轮级:53 条失败轨迹只有 29 条给出致命轮(其余判官认为是「整体无进展」没有单一致命轮);致命轮 p50 在第 13 轮 / 40 轮,致命轮之前的 assistant 字符占比均值 0.32——即当下整段压低的负梯度里约三分之一落在判官认为非致命的轮上。复判 17 条:成败预测 17/17 一致、致命轮有无 16/17 一致,但**两次都给出致命轮的 4 条里位置精确一致 0/4、±1 也 0/4**;逐轮 P/N/H 标签一致率 0.75。失败轨迹 52%、成功轨迹 46% 的轮被标「中性」。
+- 成本:prompt 中位 13.8k、输出中位 5.8k token、延迟 p50 24 s / p90 66 s;160 条 + 复判共 3.8M token。按 RL 一步 64 条估 1.5–2M token,真实计费约 $0.4/步,可承受。
+- 结论(64 条时的判断在 160 条上不变):判官能看出整条成败,但这一项我们有测试结果、不缺;**定位到轮不可靠**——位置复判 0/4、半数轮中性、还会被 agent 自述骗。期限前不上判官奖励。零成本派生物:对「纯探索轮」(ls/cat/grep,不改文件)的 loss 降权,这条不需要判官,只需要看命令是否改了文件。
+
+**并行两条方案(人类「那就按照你的来」)**,都是蒸馏口径:
+- **方案 1 short15**:同一教师池(b5+b6 共 4585 条)按 assistant 轮数筛 ≤15 轮 → 1544 条(p50 12 轮,token p50 6210),`sft/run_sft_short15.sh` = b5 脚本只换数据、**从 ep3 起**(不从 b6)、1 epoch 47 步,loss 0.40→0.36,22:07 训完。可证伪预测:40 轮内交卷回到 ≥240(ep3 240/b5 205/b6 164)。**结果(22:49):120/474 vs 134,McNemar p=0.10(both 95 / 基线独对 39 / short15 独对 25)。交卷 272,预测兑现;顶满 40 轮 197(ep3 216);但交卷者正确率 109/272 = 40%(ep3 116/240 = 48%,b6 90/164 = 55%)。** 即「交卷率由训练数据的轮数分布控制」被证实,但多出来的交卷是错的:短轨迹教会了「早交」,没教会「修对」。三轮 b5/b6/short15 = 126/118/120 全在 134 之下,交卷率 205/164/272 与 resolved 不相关——**flash 轨迹蒸馏在 2B 上的上限就在 ep3 附近,再换数据切法不会涨**(ep3 自己也是蒸馏产物,vs 基座 123 同样不显著)。蒸馏口径非增益。
+- **运行层事故(22:49–22:54):被「杀掉」的 Qwen3 LoRA 驱动链还是把 SFT 拉起来了。** 驱动链是 `nohup bash drive_qwen3_lora.sh &` 起的,bash 为 `nohup … &` 又 fork 了一层,实际是两个 bash(父 → 子);22:30 只杀了父 PID,子壳继续等 short15 的标记,22:49:32 标记一出就起了 `verl.trainer.sft_trainer`(4 卡各 32–52G),违反人类「接下来不要训 qwen」的指令,5 分钟后巡检卡占用时才发现并杀掉,没有产出 ckpt。教训:**杀驱动链要杀进程组**——起的时候用 `setsid`,杀的时候 `kill -- -<pgid>`,杀完用 `ps -eo pid,ppid,args | grep '[d]rive_'` 确认脚本名不再出现,而不是只看那一个 PID;所有「等条件再开训」的链都要这样对待,它们的危险正是在无人看着时触发。
+- **OPSD go/no-go 诊断(22:58 起,`hint_diag/run_hint_diag.sh`)。** 在评测侧 `smith_rollout.py` 加 `SMITH_HINT_MODE`(none/tests/files/patch),在 `checkout_bug_commit` 之后、`relocate_git` 之前用 `git diff HEAD~1 HEAD~2` 取金标修复(HEAD~1 是 Bug Patch、HEAD~2 是干净 main,这个区间正好是源文件上的修复、不含测试删除;先核对 HEAD~1 的提交标题含 "Bug Patch",不含就不给 hint 并计数),按模式把 F2P 测试 id / 触及文件路径 / 补丁本身(上限 8000 字符)追加到题面末尾的 `<hint>` 块;hint 取空时退化为无 hint 并在 status.json 记 `hint_chars=0`。固定子集 = val 去掉 4 道无 python 镜像后 seed 20261006 抽 100 题(18 个仓库;ep3 全量跑在这 100 题上 resolved 29、交卷 55),同一权重 SFT ep3、同一 fleet 配置(4 卡 × 6 worker、600 s、40 轮、temp 0.6)逐条件顺序跑,`hint_diag/analyze.py` 出配对 McNemar。判据写在跑之前:patch 条件是上限,它如果不比 none 高出 ≥20 题,说明瓶颈不在「知道答案」而在「按协议把改动做进文件并交卷」,OPSD 作罢;tests/files 才是训练时能拿到的特权信息,它们与 none 的差距决定路径 A 值不值得采。
+- **方案 3 Qwen3-8B LoRA**(人类问「能不能用 LoRA 代替全量」,顺便验「是不是 2B 容量问题」):`sft/run_sft_qwen3_lora.sh`,rank 64/alpha 128/all-linear、lr 1e-4、1 epoch、short20 数据 2763 条、`max_token_len_per_gpu` 8192(8B 的 logits 是 152k 词表);配对基线是零样本 22,134 只作参照。**模板陷阱**:Qwen3 原版模板只给「最后一条 user 之后」的 assistant 渲染 `<think>` 块,历史轮不带,于是 `swe_sft_dataset.py` 的前缀不变量(`full.startswith(before)`)在多轮上必炸。解法是 `/workspace/models/Qwen3-8B-nothink/`:权重符号链接到共享只读目录,`tokenizer_config.json` 里换成改版模板(所有 assistant 轮一律 `<think>\n\n</think>\n\n`+content,gen prompt 无条件追加空块),并写 `chat_template.jinja` 给 vLLM;30 行验证 bad=0、loss token 20.7%。训练和评测必须用同一个模板文件。verl 0.7.1 的 LoRA 开关是 `model.lora_rank>0`,`checkpoint.save_contents=[hf_model]` 对 PEFT 模型大概率只存 adapter,`sft/merge_lora.py` 两种布局都接(adapter → `merge_and_unload` 成 16G 全量件给 vLLM)。驱动链 `drive_qwen3_lora.sh` 等 short15 评测腾出 4 卡后自动开训→合并→评 474。**→ 人类 10-06 22:30 取消(「接下来不要训 qwen」),驱动链在等待阶段被杀,没开训、没合并件。**
+
+**Qwen3-8B 为什么只有 22/474(人类问「是不是没微调过的」)**:磁盘上 `/data/<other-user>` 是后训练版(hybrid thinking,README 里 Base 是另一个仓库),不是 Base。失败模式用 `smith.log` 逐轮命令量化(469 题,ep3 468 题对照):顶满 40 轮 p50;**重复命令占比 p50 0.65 vs ep3 0.03**,同一命令连发 ≥5 次的题 41% vs 4%;命令 rc≠0 比例 p50 0.33 vs 0.11;**从不跑 pytest(0% vs 68%)**;格式错总共 36 次(协议不是问题);97% 先读文件再改(不是瞎改)。即:它会按协议输出,但在长多轮里退化成重复同一条命令,也不验证、不提交。三个放大因素:(1) 只能用非思考模式(思考 token 吃掉 51200 上下文预算),而 Qwen3 的 agentic/代码能力主要在思考模式;(2) 用了 MiniCPM 的采样参数(temp 0.6/top_p 0.95/top_k 20),Qwen 非思考推荐 temp 0.7/top_p 0.8 并加 presence_penalty 抑制重复,没调;(3) 协议(THOUGHT + 单 bash 块 + 自己决定何时 submit)它没见过,ep3 的 134 里有相当一部分是 SFT 学来的协议与「跑测试再交」的习惯。文献参照:SWE-smith 论文里 Qwen2.5-Coder-7B 要用 5k 条轨迹微调后才到 SWE-bench Verified 15.2%(SWE-agent-LM-7B),未微调的 7B 级模型在 bash 脚手架上公开报告普遍只有个位数,22/474=4.6% 不离谱。所以 22 不是 Qwen3-8B 的上限,但「零样本很拉」是这类小模型的常态,不是这份权重坏了。
+
+**工程陷阱:`/` 满 = 启动瞬间 SIGSEGV**。short15 首次启动 rank 0 两秒内段错误、无 python 栈。`df /` 显示 0 字节空闲(`/root/.cache` 675G 与别人的 `/tmp/*`,都不是我的)。torch/triton/inductor 往 `/tmp` 或 `~/.cache` 写缓存失败直接崩。修法:训练脚本统一 `export TMPDIR TRITON_CACHE_DIR TORCHINDUCTOR_CACHE_DIR TORCH_EXTENSIONS_DIR XDG_CACHE_HOME HF_HOME` 到 `/data`,之后一次启动成功。**没有栈的启动期段错误,先查磁盘再查代码**。

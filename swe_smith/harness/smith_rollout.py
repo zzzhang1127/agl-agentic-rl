@@ -152,6 +152,67 @@ def eval_meta_from_env() -> dict[str, Any]:
     return json.loads(open(path, encoding="utf-8").read())
 
 
+HINT_PATCH_CHAR_CAP = int(os.environ.get("SMITH_HINT_PATCH_CHARS", "8000"))
+
+
+def build_hint(mode: str, meta: dict[str, Any]) -> str:
+    """Privileged-information hint for the OPSD go/no-go diagnostic (10-06).
+
+    Called AFTER checkout_bug_commit (HEAD = `Remove F2P Tests`, HEAD~1 = `Bug
+    Patch`, HEAD~2 = clean main) and BEFORE relocate_git, so plain git works.
+    `git diff HEAD~1 HEAD~2` is the reverse of the bug patch = the gold fix on
+    source files only (the test deletion lives in HEAD, which is not in that range).
+    Modes: none | tests (F2P node ids from the dataset, no git) | files (paths the
+    fix touches) | patch (the gold diff itself, capped). Returns "" on failure so a
+    broken hint degrades to the un-hinted condition instead of crashing the rollout.
+    """
+    mode = (mode or "none").strip().lower()
+    if mode == "none":
+        return ""
+    if mode == "tests":
+        nodes = meta.get("FAIL_TO_PASS") or []
+        if isinstance(nodes, str):
+            try:
+                nodes = json.loads(nodes)
+            except Exception:
+                nodes = [nodes]
+        nodes = [str(n) for n in nodes][:20]
+        if not nodes:
+            return ""
+        return (
+            "<hint>\nThe following tests must pass after your fix (they are currently absent from the "
+            "repository and will be restored at grading time; use their names to locate the relevant module):\n"
+            + "\n".join(f"- {n}" for n in nodes)
+            + "\n</hint>"
+        )
+    subj = sa._git_retry(["log", "-1", "--format=%s", "HEAD~1"], timeout=60, attempts=2)
+    if subj is None or subj.returncode != 0 or "Bug Patch" not in (subj.stdout or ""):
+        sa.log.error("hint: HEAD~1 is not the Bug Patch commit (%s); no hint", (subj.stdout if subj else "timeout"))
+        return ""
+    if mode == "files":
+        proc = sa._git_retry(["diff", "--name-only", "HEAD~1", "HEAD~2"], timeout=60, attempts=2)
+        if proc is None or proc.returncode != 0:
+            return ""
+        paths = [p for p in (proc.stdout or "").splitlines() if p.strip()]
+        if not paths:
+            return ""
+        return "<hint>\nThe bug is located in the following file(s):\n" + "\n".join(f"- {p}" for p in paths) + "\n</hint>"
+    if mode == "patch":
+        proc = sa._git_retry(["diff", "HEAD~1", "HEAD~2"], timeout=60, attempts=2)
+        if proc is None or proc.returncode != 0 or not (proc.stdout or "").strip():
+            return ""
+        diff = proc.stdout
+        if len(diff) > HINT_PATCH_CHAR_CAP:
+            diff = diff[:HINT_PATCH_CHAR_CAP] + "\n... [patch truncated]\n"
+        return (
+            "<hint>\nA reference patch that fixes the issue is given below. Apply the equivalent change to the "
+            "files under /testbed by editing them directly (git is not available), verify, then submit:\n"
+            "```diff\n" + diff.rstrip("\n") + "\n```\n</hint>"
+        )
+    sa.log.error("hint: unknown SMITH_HINT_MODE=%r; no hint", mode)
+    return ""
+
+
 def main() -> int:
     sa.logging.basicConfig(
         level=sa.logging.INFO,
@@ -173,6 +234,7 @@ def main() -> int:
     max_format_errors = int(os.environ.get("SMITH_MAX_FORMAT_ERRORS", "3"))
     gateway_wait_s = float(os.environ.get("SMITH_GATEWAY_WAIT_S", "600"))
     out_path = os.environ.get("AGL_STATUS_OUT", "/opt/agl_eval/status.json")
+    hint_mode = os.environ.get("SMITH_HINT_MODE", "none").strip().lower()
 
     sa._query = _query  # type: ignore[method-assign]
     client = OpenAI(base_url=base_url, api_key=api_key)
@@ -184,10 +246,20 @@ def main() -> int:
         "max_prompt_tokens": 0,
         "overflowed": False,
         "error": None,
+        "hint_mode": hint_mode,
+        "hint_chars": 0,
     }
     try:
-        sa.log.info("SmithAgent rollout start: instance=%s max_turns=%d", instance_id, max_turns)
+        sa.log.info("SmithAgent rollout start: instance=%s max_turns=%d hint=%s", instance_id, max_turns, hint_mode)
         sa.checkout_bug_commit(instance_id)
+        if hint_mode != "none":
+            hint = build_hint(hint_mode, meta)
+            status["hint_chars"] = len(hint)
+            if hint:
+                problem = problem + "\n\n" + hint
+                sa.log.info("hint injected: mode=%s chars=%d head=%r", hint_mode, len(hint), hint[:160])
+            else:
+                sa.log.error("hint requested (%s) but empty; running un-hinted", hint_mode)
         sa.relocate_git()
         submitted, n_turns, max_prompt_tokens = sa.run_agent_loop(
             client,

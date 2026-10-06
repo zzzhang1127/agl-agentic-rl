@@ -261,6 +261,7 @@ def run_one_instance(instance: dict[str, Any], run_image: str | None = None) -> 
             ("SMITH_CMD_TIMEOUT", os.environ.get("SMITH_CMD_TIMEOUT", "120")),
             ("SMITH_TEMPERATURE", os.environ.get("SMITH_TEMPERATURE", "1.0")),
             ("SMITH_MAX_FORMAT_ERRORS", os.environ.get("SMITH_MAX_FORMAT_ERRORS", "3")),
+            ("SMITH_HINT_MODE", os.environ.get("SMITH_HINT_MODE", "none")),  # 10-06 OPSD go/no-go 诊断,默认 none = 原行为
             ("AGL_INSTANCE_JSON", "/opt/agl_eval/instance.json"),
             ("AGL_STATUS_OUT", "/opt/agl_eval/status.json"),
             ("OPENAI_API_KEY", "dummy"),

@@ -44,6 +44,15 @@ OUTTOK=${FLEET_MAX_TOKENS:-4096}    # prompt 上限 = CTX - OUTTOK = 47104
 TURNS=${SMITH_MAX_TURNS:-40}        # 09-05 那次用了 10000,69% 的 episode 死于上下文溢出
 TEMP=${SMITH_TEMPERATURE:-0.6}
 LIMIT=${AGL_SWEEP_LIMIT:-}
+# 10-06 换模型评测(人类令:同框架评 Qwen3-8B)。默认值与此前逐字相同,MiniCPM 血统的读数不受影响。
+#   FLEET_SERVED_NAME   vLLM 对外模型名 = agent 请求里的 model 字段
+#   FLEET_CHAT_TEMPLATE 模板文件;"none" = 用模型 tokenizer_config 自带的模板(Qwen3 走这条)
+#   FLEET_ROPE_SCALING  传给 --rope-scaling 的 JSON(Qwen3-8B 原生 40960 < CTX 51200,要 YaRN)
+NAME=${FLEET_SERVED_NAME:-MiniCPM5-2B}
+TEMPLATE=${FLEET_CHAT_TEMPLATE:-/workspace/models/MiniCPM5-2B/chat_template.jinja}
+ROPE=${FLEET_ROPE_SCALING:-}
+TPL_ARGS=(); [ "$TEMPLATE" != none ] && TPL_ARGS=(--chat-template "$TEMPLATE")
+ROPE_ARGS=(); [ -n "$ROPE" ] && ROPE_ARGS=(--rope-scaling "$ROPE")
 
 cmd=$1; shift
 if [ "$cmd" = start ]; then
@@ -63,11 +72,11 @@ if [ "$cmd" = start ]; then
     local k=$1 g=${CARDS[$1]} port=${PORTS[$1]} used total util
     read used total <<< $(nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits -i $g | tr -d ',')
     util=$(python3 -c "print(round(($used + $BUDGET)/$total, 3))")
-    echo "gpu$g port=$port used=${used}MiB budget=${BUDGET}MiB util=$util ctx=$CTX"
+    echo "gpu$g port=$port used=${used}MiB budget=${BUDGET}MiB util=$util ctx=$CTX name=$NAME template=$TEMPLATE rope=${ROPE:-none}"
     CUDA_VISIBLE_DEVICES=$g VLLM_USE_V1=1 nohup $PY -m vllm.entrypoints.openai.api_server \
-      --host 0.0.0.0 --port $port --model $MODEL --served-model-name MiniCPM5-2B --dtype bfloat16 \
+      --host 0.0.0.0 --port $port --model $MODEL --served-model-name $NAME --dtype bfloat16 \
       --max-model-len $CTX --max-num-seqs $SEQS --gpu-memory-utilization $util \
-      --chat-template /workspace/models/MiniCPM5-2B/chat_template.jinja \
+      "${TPL_ARGS[@]}" "${ROPE_ARGS[@]}" \
       --override-generation-config '{"temperature": 0.6, "top_p": 0.95, "top_k": 20}' \
       > vllm_smith_${TAG}_gpu$g.log 2>&1 &
     echo $! > vllm_smith_${TAG}_k$k.pid
@@ -102,7 +111,7 @@ if [ "$cmd" = start ]; then
     AGL_SWEEP_LIMIT=$LIMIT \
     AGL_SAMPLE_TIMEOUT=$TO SMITH_EVAL_TIMEOUT=$TO \
     SMITH_MAX_TURNS=$TURNS SMITH_TEMPERATURE=$TEMP SMITH_OBS_CHAR_CAP=${SMITH_OBS_CHAR_CAP:-6000} \
-    AGL_MAX_TOKENS=$OUTTOK AGL_MAX_MODEL_LEN=$CTX AGL_MODEL=MiniCPM5-2B \
+    AGL_MAX_TOKENS=$OUTTOK AGL_MAX_MODEL_LEN=$CTX AGL_MODEL=$NAME \
     AGL_VLLM_URL=http://127.0.0.1:${PORTS[$k]} \
     nohup python3 run_smith_sweep.py > smith_${TAG}_shard$s.log 2>&1 &
     echo $! > smith_${TAG}_k$k.pid
