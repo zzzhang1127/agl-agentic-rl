@@ -3982,3 +3982,15 @@ HMPO（`rollout.n=8`，`SMITH_HMPO=1`，从这份前缀权重起）按「SFT 不
 2. 补上 venv 的 `PATH` 之后，verl 走 V1 `AsyncLLM`，环境里 `VLLM_USE_V1` 却是关的，和 s5 当时显式 `VLLM_USE_V1=1` 不一致。同时关掉 MiniCPM 不该挂的 Hermes `tool_call_parser`（s5 是 `None`），chat template 用基座那份 jinja。`/tmp` 和 `/data` 的 `bavail=0` 是 root 预留块，ray 会报 95% full；没有去删已落盘权重。
 
 第三次启动带上 `VLLM_USE_V1=1` 和 `TMPDIR` 在 `/data`。显存占用按 0.4，不用 s5 的 0.95，避免挤占同卡上别人的进程。
+
+## §80 HMPO 第一次真正跑通 rollout，更新权重前被序列长度断言打断(2026-10-09)
+
+§79 的第三次启动在 vLLM 初始化时失败：`gpu_memory_utilization=0.4` 扣掉同卡已有占用后，KV cache 一块都分不到。第四次改到空闲的两张卡、占用 0.65，vLLM 起来了，32 个环境 pod 也创建了。
+
+pod 先全部 Pending。节点从 10-05 起带 `node.kubernetes.io/disk-pressure`。根因不是盘真的写满：ext4 默认预留 5%，`statvfs` 的 available 对 kubelet 是 0，而 free 仍有几十到两百 GiB。把 `/` 和数据盘的预留改成 1% 之后，available 分别回到约 49GiB 和 208GiB，没有删权重。kubelet 仍不撤污点，因为它的 `eviction-minimum-reclaim` 是容量的 10%（数据盘大约还要再腾出 600GiB 才肯停）。日志里是 `wanted to free 9223372036854775807 bytes`。把 minimum reclaim 改成 1Gi 并重启 k3s 之后，DiskPressure 消失。
+
+镜像名要 `:openai`，本机只有 `:latest`，`IfNotPresent` 仍去 Docker Hub 并超时。给本机 132 个 SWE-smith 镜像补了 `:openai` 标签，pod 才跑起来。
+
+第一批 rollout 的输出能解析、能执行。抽了 29 条已经写完的日志：每条都有 `turn=N cmd=... rc=0`，29 条里 12 条 binary 奖励为 1，轮数从 3 到 40。这不是格式崩溃。
+
+权重一次都没更新。32 条轨迹收齐后，actor 算 old log-prob 断言失败：`max_token_len=8192`，实际合并轨迹 `max_seq_len=131072`。轨迹上限是 prompt 65536 + response 65536，刚好顶满。重启时把合并后的 prompt/response 都收成 8192，actor 的 `ppo_max_token_len_per_gpu` 设成 16384，checkpoint 目录用命令行钉死，避免 `.env` 把 `AGL_CKPT_DIR` 盖回旧目录。超长轨迹的后半会被截断，奖励仍记在保留下来的 token 上。这一截还没走完一个 optimizer step。
