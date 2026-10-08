@@ -14,7 +14,7 @@
 | **SWE-smith**（多轮 coding agent） | MiniCPM5-2B（2.5B，Llama 架构） | 官方 smith harness + GRPO，五条血统 s1–s5 | 134/474 | s5 step 10：132/474（p=0.90）；step 20：135/474（p=1.00），暂停于 step 20 转蒸馏 | 无显著增益 | 固定 474 题验证集，temperature 0.6，真实上限 470（4 题的镜像任何模型都做不出）；此前四条血统要么平线要么坍塌，根因都已定位（见下） |
 | **SWE-smith 蒸馏** | 基座 → 教师轨迹 SFT | deepseek-v4-flash 轨迹，只留做对的题 | 基座 123/474 | SFT ep3 127/474（同一旧模板，差异不显著）；模板修复后重测 134；b5 续训 1 epoch 后 **126/474**（p=0.36）；b6 再续 1 epoch 后 **118/474**（vs 134，McNemar p=0.056）；只用 ≤15 轮教师轨迹从 ep3 续 1 epoch（short15）**120/474**（p=0.10） | 三轮都低于 ep3，无增益 | 这是蒸馏口径，不是 RL 增益；第 5 批 707 条、第 6 批 3878 条（全训练集采完，互斥）；**失败模式是交卷率下滑**：40 轮内提交的题 240→205→164，提交者的正确率反而 56%→72%，即学生学到了教师「多探索再交」的风格却收敛不了（见 swe_smith/README） |
 
-截至 2026-10-06。两条线的详细结果、血统表和根因见 [`gsm8k/README.md`](gsm8k/README.md) 与 [`swe_smith/README.md`](swe_smith/README.md)。
+截至 2026-10-08。两条线的详细结果、血统表和根因见 [`gsm8k/README.md`](gsm8k/README.md) 与 [`swe_smith/README.md`](swe_smith/README.md)。
 
 ## 仓库结构
 
@@ -31,7 +31,7 @@ swe_smith/
   containers/     SWE-smith 任务镜像的规划与预拉
   opencode_lineage/  更早的 OpenCode-harness 血统（v2–v4）与它的教师流水线，已被 smith harness 取代
 patches/          对 agent-lightning 核心库的 diff（+1016/−49）、配套单测、verl dp_group 补丁
-docs/             踩坑与经验（§1–§66，按「现象 → 根因 → 解决 → 经验」写）
+docs/             踩坑与经验（§1–§76，按「现象 → 根因 → 解决 → 经验」写）
 ```
 
 ## 方法概览
@@ -68,7 +68,7 @@ trainer 与 vLLM 推理共置在同一组 GPU 上，每步先 rollout 再更新�
 
 ## 之后会更新什么
 
-- s5 两次探针平线后已暂停（step 20 的 ckpt 保留，可 resume）。教师轨迹 SFT 两轮（b5、b6）都没有增益且交卷率递减，原配方不再续训；下一步在数据侧改（按轮数筛短教师轨迹、把剩余轮数写进 prompt 让学生学会收尾、教师采样超时与评测对齐），或从 s5 step 20 恢复 RL。
-- 同一 harness 下的参照读数：Qwen3-8B 零样本 22/474（非思考、YaRN 2.0，见 swe_smith/README），只作参照，不与血统混报。
-- 短教师轨迹（≤15 轮）从 SFT ep3 续训 1 epoch 的结果：120/474（p=0.10），交卷率按预测回升到 272 但交卷正确率跌到 40%，教师轨迹蒸馏在这个 2B 上到顶了（见 swe_smith/README）。下一步是特权信息自蒸馏（同一模型带答案 / 不带答案各跑一次做 on-policy distillation），先测带答案是否真的强得多。Qwen3-8B 上的 LoRA SFT 已取消（零样本 22/474 的失败模式是长多轮退化重复，见 swe_smith/README）。「教师模型逐轮审视学生 rollout 给稠密奖励」的离线试点已做完：序列级成败判断准确率 0.85，但轮级定位复判一致 0/4，不采用。
+- s5 两次探针平线后已暂停。教师轨迹 SFT（b5/b6/short15）与拒绝采样 RFT1/RFT2（130/127）都没有可报增益。特权信息：金标 patch 在 100 题诊断上是 64 vs 24，但可训练的 tests/files 几乎不动；训出的 OPSD2/GKD1 为 109/108，低于 ep3 134。原配方不再续训。
+- 同一 harness 参照：官方 MiniCPM5-2B-SFT **92/474**；MiniCPM5-1B **0/474**（256 题格式中止）；Qwen3-8B 零样本 22/474；Qwen3.6 未适配 **100/474**（406 题格式中止）。适配成 bash fence 后 32 题与 ep3 打平（8/32），全量 474 教师资格评测进行中（见 §72–§73）。不训 Qwen。
+- short15 证明「全局轮数硬切」只提高交卷率、降低交对率。下一步若教师资格过门（或退回 flash 286），用**最短成功前缀**（线性扫描，不能二分）从训练集轨迹做 1 epoch SFT，而不是再灌长轨迹。HMPO / 二次尝试 / 序列级 OPD 都有闸门，见 §75–§76。
 - `docs/pitfalls-and-lessons.md` 持续追加。

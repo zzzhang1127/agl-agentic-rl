@@ -3840,3 +3840,92 @@ MDE +18。判 CONTINUE_WARN:在噪声量级内,既不是增益也不构成「明
 **Qwen3-8B 为什么只有 22/474(人类问「是不是没微调过的」)**:磁盘上 `/data/<other-user>` 是后训练版(hybrid thinking,README 里 Base 是另一个仓库),不是 Base。失败模式用 `smith.log` 逐轮命令量化(469 题,ep3 468 题对照):顶满 40 轮 p50;**重复命令占比 p50 0.65 vs ep3 0.03**,同一命令连发 ≥5 次的题 41% vs 4%;命令 rc≠0 比例 p50 0.33 vs 0.11;**从不跑 pytest(0% vs 68%)**;格式错总共 36 次(协议不是问题);97% 先读文件再改(不是瞎改)。即:它会按协议输出,但在长多轮里退化成重复同一条命令,也不验证、不提交。三个放大因素:(1) 只能用非思考模式(思考 token 吃掉 51200 上下文预算),而 Qwen3 的 agentic/代码能力主要在思考模式;(2) 用了 MiniCPM 的采样参数(temp 0.6/top_p 0.95/top_k 20),Qwen 非思考推荐 temp 0.7/top_p 0.8 并加 presence_penalty 抑制重复,没调;(3) 协议(THOUGHT + 单 bash 块 + 自己决定何时 submit)它没见过,ep3 的 134 里有相当一部分是 SFT 学来的协议与「跑测试再交」的习惯。文献参照:SWE-smith 论文里 Qwen2.5-Coder-7B 要用 5k 条轨迹微调后才到 SWE-bench Verified 15.2%(SWE-agent-LM-7B),未微调的 7B 级模型在 bash 脚手架上公开报告普遍只有个位数,22/474=4.6% 不离谱。所以 22 不是 Qwen3-8B 的上限,但「零样本很拉」是这类小模型的常态,不是这份权重坏了。
 
 **工程陷阱:`/` 满 = 启动瞬间 SIGSEGV**。short15 首次启动 rank 0 两秒内段错误、无 python 栈。`df /` 显示 0 字节空闲(`/root/.cache` 675G 与别人的 `/tmp/*`,都不是我的)。torch/triton/inductor 往 `/tmp` 或 `~/.cache` 写缓存失败直接崩。修法:训练脚本统一 `export TMPDIR TRITON_CACHE_DIR TORCHINDUCTOR_CACHE_DIR TORCH_EXTENSIONS_DIR XDG_CACHE_HOME HF_HOME` 到 `/data`,之后一次启动成功。**没有栈的启动期段错误,先查磁盘再查代码**。
+## §69 官方 MiniCPM5-2B-SFT 与 MiniCPM5-1B：同词表更弱的亲戚当不了教师(2026-10-07)
+
+人类问：有没有更老、词表一样（130560）的 MiniCPM，能不能当教师或对照。Hugging Face / ModelScope 上同架构可下载的是官方 **MiniCPM5-2B-SFT** 和 **MiniCPM5-1B**，同一套 LlamaForCausalLM、同一词表。把它们放进**完全同一套**官方 smith harness（temp 0.6 / top_p 0.95 / top_k 20 / 40 轮 / 600 s，固定 474 题）评完：
+
+| 权重 | resolved | 相对 ep3 134 | 失败画像 |
+|---|---|---|---|
+| MiniCPM5-2B 基座 | 123/474 | McNemar p=0.22，不显著 | 会协议，弱于 ep3 |
+| SFT ep3（OpenCode 教师轨迹训出来的，模板修复后重测） | **134/474** | 对照 | 交卷 ~240 |
+| 官方 MiniCPM5-2B-SFT | **92/474** | 显著更差 | 不是「没见过协议」，是修 bug 更弱 |
+| MiniCPM5-1B | **0/474** | — | 256/474 格式中止，几乎说不出「一个 THOUGHT + 一个 bash 块」 |
+
+**经验**：同词表不等于能蒸馏。1B 连协议都过不了，2B-SFT 官方件比我们用 OpenCode 轨迹训出的 ep3 还差 42 题。跨模型教师必须先过「同一 harness、同一 474、McNemar 相对 ep3」这道门，过不了就不要当教师。ep3 自己相对基座 123 也不显著（p=0.22），它能当对照只是因为它是目前这条线上最稳的读数，不是因为它被证明「学会了修 bug」。
+
+## §70 拒绝采样两轮（RFT1/RFT2）还是贴着 134，报不了增益(2026-10-07)
+
+做法：用学生自己（或带 hint 的学生）在训练集上采样，只留 `resolved` 且已提交的轨迹，从 ep3 再 SFT 1 epoch。这是拒绝采样 / RFT 口径，**不是 RL**。
+
+- RFT1（无 hint 学生轨迹）：**130/474** vs ep3 134
+- RFT2（hint 条件采集后再 SFT）：**127/474** vs 134
+
+方向与 b5/b6/short15 一样，全在 134 附近或之下，McNemar 都不构成可报增益。**经验**：学生已经会协议之后，再用「做对的自己的轨迹」喂回去，等于在同一个行为分布上微调，解决不了 credit assignment，也解决不了「2B 学了教师的探索长度却收敛不了」（§67）。RFT 在这条线上不是新杠杆。
+
+## §71 特权信息：金标 patch 上限成立，可训练的 tests/files 几乎不动；训出来的 OPSD/GKD 更差(2026-10-07)
+
+§68 的 go/no-go 跑完了。同一 ep3 权重、固定 100 题（val 去掉 4 道无 python 镜像后抽的）：
+
+| 题面特权 | resolved | 交卷 | vs none |
+|---|---|---|---|
+| none | 24/100 | 39 | — |
+| F2P 测试名 | 23/100 | 51 | −1 |
+| 触及文件路径 | 31/100 | 61 | +7（不到事先写的 +20） |
+| 金标 patch（泄漏答案） | **64/100** | 81 | **+40** |
+
+金标补丁贴进题面，上限确实高——「看见答案就会做」这部分是真的。但这是评测泄漏，训练也不能用。真正能当训练特权、评测时拿不到的，是 tests/files，它们几乎不动。
+
+随后按特权信息训出的权重（蒸馏口径，不是 RL）全量 474：OPSD2 **109/474**（交卷 280），GKD1 **108/474**（交卷 258），对照 ep3 134。方向是跌。OPSD1 一次全量 0/474 是失败跑（采集/格式崩了），不当对照。
+
+跨词表的 **token 级 reverse-KL（MOPD）做不了**：MiniCPM 词表 130560，Qwen 不是同一套 id。能做的只有序列级 `log P_T(y)`（学生采样 → 反分词成文本 → 教师打整段 logprob），代码在 `swe_smith/distillation/seq_opd_score.py`。前提仍是教师本身显著强于 ep3。
+
+**经验**：先测「泄漏答案的上限」，再测「训练时真能拿到的特权」。上限高但可训练特权不动，就不要开 OPSD。OPSD/GKD/RFT 一律标「自蒸馏 / 蒸馏」，不要写成 RL。
+
+## §72 Qwen3.6 的格式死亡：答案在 tool_calls 里，harness 只看 content(2026-10-08)
+
+通俗讲：官方 smith 协议规定助手每一轮只能回一段思考，再加**恰好一个** ` ```bash ` 代码块，里面是要在容器里执行的命令。MiniCPM 是这么训的，`parse_action` 也只认这一种。
+
+Qwen3.6 默认按「工具调用模型」说话：HTTP 响应里 `content` 经常是空的，真正的命令写在 OpenAI 风格的 `tool_calls`，或者写成 Hermes XML `<tool_call>{...}</tool_call>`，再夹一层 `<think>`。harness 读 `message.content`，看见空字符串或 XML，就记一次 format error。连续三次，`SMITH_MAX_FORMAT_ERRORS=3` 直接杀掉这题——**模型可能已经在内部知道要 `sed` 哪个文件，但学生侧的裁判根本没看见这条命令**。
+
+未适配的 Qwen3.6 全量：**100/474**，其中 **406/474** 是格式中止。这 100 不能拿来跟 ep3 的 134 比「谁更会修 bug」，因为分母里 86% 的题它没被允许做完。Qwen3-8B 的 22/474 是另一种病（协议对了、长多轮退化成重复命令，§68）；Qwen3.6 是协议根本没对上。两种失败不要混着讲。
+
+**不能改的**：MiniCPM 的 `parse_action`、`SMITH_MAX_FORMAT_ERRORS`、单 fence 规则。改了学生评测口径，之前所有 474 读数作废。
+
+**能改的**：教师侧加一层 HTTP 代理，把 `tool_calls` / Hermes XML / 残余 think 块收成一个 bash fence，再交给同一套 harness。失败则原样转发，让 format error 被记录，而不是替模型编造命令。代码：`swe_smith/distillation/teacher_rewrite.py` + `teacher_proxy_rewrite.py`。学生评测仍然直连自己的 vLLM。
+
+关掉 thinking 不是「口头告诉模型不要想」，也不是把生成的 CoT 藏起来。MiniCPM / Qwen 的 chat 模板在 `enable_thinking=False` 时会在 assistant 前填好空的 `\n\n`（或 `<think>\n\n</think>\n\n`），模型接着写正文。AGL 代理必须把 `chat_template_kwargs` 透传（§57），否则训练和评测看到的前缀不一致。
+
+## §73 适配后的 32 题 smoke：8/32 与 ep3 打平；尾部三连错不是第 3 轮猝死(2026-10-08)
+
+Qwen3.6 + rewrite 代理，同一 32 题子集（与 ep3 逐题配对）：**8/32 vs ep3 8/32**，McNemar p=1（独对各 3，双对 5）。过了「能干活」这道门，**没过「显著强于 ep3」**。
+
+适配之后日志里仍会出现 `format_abort`，但机制变了：不是第 3 轮就死，而是先正常跑了 17–34 轮（读文件、改文件、跑 pytest），最后用一段散文「我做完了」或再套一个代码块收尾，被连续三次 format error 杀掉，没执行到 `COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`。启发式「连续格式错」在 episode **结束时**才亮，容易误判成旧的 turn-3 死亡。看 `n_turns` 和 smith.log 里成功执行过的 `cmd=`，不要只看 termination 字符串。
+
+32 题打平不够当教师。教师资格写在跑之前：全量 474、McNemar 相对 ep3 134，且必须显著。flash 教师在同一官方 harness 上是 **286/474**（OpenCode 口径的数不能拿来比；这里说的是 smith 协议下采轨迹时的 resolved），那才是目前合格的强教师。验证集轨迹**不许**进 SFT。
+
+全量 `val_qwen36_adapted` 于 2026-10-08 13:53 在空闲卡剩余显存上启动（不杀邻进程），8 worker，rewrite 代理与 flash 教师代理分端口，避免覆盖 flash 那份代理。写本节时已完成 41/474、resolved 9（早期题偏 bottle，比例不可外推），sweep 仍在跑。终值出来之前，Qwen **不能**当教师，也不采它的验证集轨迹。
+
+## §74 short15 的病根不是「轨迹太长」，是「截断位置不是最短成功前缀」(2026-10-08)
+
+short15（§68）按**全局轮数硬切 ≤15**，把「修对了但多逛了几轮」的轨迹扔掉，留下「碰巧早交」的。交卷率按预测回升，交卷正确率跌到 40%：模型学会了早交，没学会修对。
+
+最短成功前缀是另一件事：一条已经 `resolved` 的轨迹，从前往后找**最小的 k**，使得只回放前 k 个动作、pytest 仍过。这不是按 15 切，也**不能二分**：后面的动作可以破坏已经修好的树，`eval(k)` 对 k **不单调**，二分会把「中间过、两端不过」切错。实现是对编辑类动作的 k 做线性扫描，先对完整轨迹做一次 sanity eval；完整回放都不过（环境漂移）就丢弃，不要退回原长轨迹。过滤与 Qwen3-Coder 同类：无 submit、格式坏、改测试 / 动隐藏 git 的丢掉。
+
+代码：`swe_smith/distillation/shortest_prefix.py`（线性扫描）、`shortest_prefix_replay.py`（docker 回放）、`build_prefix_sft_jsonl.py`。SFT 起点仍是 ep3，1 epoch，lr 5e-6。数据必须来自**训练集**上过门教师的轨迹；flash 的 b6 jsonl 目前 `status.json` 里没有 `messages`（代理组装的），要先从 assembler / smith.log 还原再回放。教师资格没过之前不开 SFT。
+
+## §75 全局轮数罚会变成「早交卷」通道；HMPO 把长度预算收到「做对的组内中位数」(2026-10-08)
+
+s4（§62）已经实证：同样做对时，轮数罚是组内最稳的信号，模型学到的是早交（提交率 71%）而不是修 bug。HMPO 的改法是：**做错的永远 0**；长度预算 = 组内**做对**的轨迹长度中位数；做对且短于预算的得 1，长于预算的按 `clip(budget/len, floor, 1)` 打折。全错组仍全 0，短而错的排不到做对的前面。这和「全局 T0=32、λ=0.1」不是一回事。
+
+过程信号用环境状态，不用金标 diff 重叠：F2P 通过数的增量、复现脚本从失败变通过。金标 overlap 是漏答案。代码：`swe_smith/training/hmpo_reward.py`、`env_state_reward.py`。门闩：**SFT 相对 ep3 显著之前，不开 HMPO RL**。平台期再考虑失败后二次尝试（FC-SWE）：重置工作树，把失败 patch + pytest 日志作为下一条 user，两次 attempt 各自计分，后一次成功不给前一次零分刷成 1。默认 `SMITH_RECOVERY_ATTEMPTS=0`，评测关着。代码：`swe_smith/agents/recovery.py`。
+
+## §76 截至 2026-10-08 的闸门（写下来是为了以后不被「先训起来」带跑）
+
+1. MiniCPM `parse_action` 不动。教师格式只允许改代理。
+2. 不训 Qwen。Qwen 只当候选教师或参照。
+3. 教师资格：同一 smith harness、val-474、McNemar vs ep3 134，显著才采**训练集**轨迹。32 题打平不算过门。
+4. 验证集轨迹不进 SFT。flash 286 仍是合格教师；Qwen 适配 474 未出终值，终值不显著则继续只用 flash，走最短前缀而不是再灌长轨迹。
+5. 最短前缀 SFT → 显著才能 HMPO；RL 平台期才加 FC-SWE；序列级 OPD 仅当教师 ≫ ep3。
+6. `/` 与数据盘水位、不杀邻进程、不删 SFT ep3 / `ckpt_step5722.pt`，仍有效。
+7. 实验记录的家是本仓库 `docs/pitfalls-and-lessons.md`，不是 microsoft/agent-lightning。公开仓库脱敏：个人目录写成 `/workspace`，邻进程写成 `<neighbour-process>`。
+8. `gh` 装在 `~/.local/bin`，不在默认 PATH；推送用绝对路径或先 `export PATH="$HOME/.local/bin:$PATH"`。
