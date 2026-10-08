@@ -3964,3 +3964,21 @@ HMPO 有一个真 bug：`train_smith_agent.py` 里的 `algorithm.hmpo` **VERL �
 先前 GKD1 108 / PG-OPD1 119 对照 134 更差或 n.s.，那次教师是 **带金标 patch hint 的 ep3**，不是「师生各自 rollout」。明天若 SFT/HMPO 都没增益，按新口径重做同词表蒸馏：学生用 MiniCPM SFT（前缀或 ep3，看谁评测更好），教师用**没训过的原版 MiniCPM5-2B**（123/474，弱于 134，有把学生往回拉的风险，必须写进笔记），损失是逐 token 软标签 KL，以及师生都 rollout 的 GKD / PG-OPD。
 
 验收数字只认 val-474 vs `val_sft3_tmpl2` 134 的 McNemar。Qwen 不当教师。
+
+## §79 最短前缀 SFT：128/474，对照 134，p=0.56；HMPO 两次启动都是环境 bug(2026-10-09)
+
+`val_sft_prefix` 全量 474，官方 smith harness（`skip_special_tokens=False`，原生 `<function>` 解析）。对照 `val_sft3_tmpl2`：
+
+| | resolved | 交卷 | 轮数中位 | 打满 40 轮 |
+|---|---|---|---|---|
+| ep3 | 134 | 240 | 31 | 216 |
+| 前缀 SFT | **128** | 270 | 28 | 198 |
+
+配对：ep3 独对 39，前缀独对 33，差 −6，McNemar exact **p=0.56**。不是增益。交卷变多、做对变少，和 §75 的「早交卷」同一方向，只是这次来自 SFT 数据而不是轮数罚。格式中止没有占满日志，输出能被解析执行。这不是 RL。
+
+HMPO（`rollout.n=8`，`SMITH_HMPO=1`，从这份前缀权重起）按「SFT 不显著就开」启动，前两次都没进入 rollout：
+
+1. `run.sh` 调用裸 `python`，机器上只有 `python3` 和 venv。进程秒退。
+2. 补上 venv 的 `PATH` 之后，verl 走 V1 `AsyncLLM`，环境里 `VLLM_USE_V1` 却是关的，和 s5 当时显式 `VLLM_USE_V1=1` 不一致。同时关掉 MiniCPM 不该挂的 Hermes `tool_call_parser`（s5 是 `None`），chat template 用基座那份 jinja。`/tmp` 和 `/data` 的 `bavail=0` 是 root 预留块，ray 会报 95% full；没有去删已落盘权重。
+
+第三次启动带上 `VLLM_USE_V1=1` 和 `TMPDIR` 在 `/data`。显存占用按 0.4，不用 s5 的 0.95，避免挤占同卡上别人的进程。
