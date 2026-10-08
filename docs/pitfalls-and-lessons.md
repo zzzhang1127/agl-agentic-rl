@@ -3950,3 +3950,17 @@ s4（§62）已经实证：同样做对时，轮数罚是组内最稳的信号�
 2. 回放脚本必须挂上 `instance.json` + `eval_inside.py`，先藏 `.git` 再评，且**不能** `set -e`（教师轨迹里失败的 `ls`/`grep` 本来就不会停）。stdout 是 indent 过的 JSON，不能只 `json.loads` 最后一行。
 3. 截到编辑步之后一定要补 submit，否则学生学会「改完就停」。
 4. `/data` 的 `df` Available=0 往往是 root 预留块，size−used 仍可能大于 50G。没有 `global_step_*.tmp` 就不要删已经落盘的失败 SFT 权重。
+
+## §78 最短前缀 SFT 训完；评测路径又和 134 口径分叉了(2026-10-08)
+
+前缀 SFT（`sft_prefix_from_ep3`）1 epoch 跑完：109/109 step，约 15 分钟，loss ≈ 0.36，权重在 `MiniCPM5-2B-sft-prefix`。SwanLab：https://swanlab.cn/@zzzluvst/swe_smith_sft/runs/5tew8krp92k6chv4rq700 。这不是 RL。
+
+自动 val-474 **没跑起来**。`smith_fleet.sh` 在启动前检查 `smith_rollout.py` 是否含 `skip_special_tokens` / `strip_turn_delims` / `_STOP_STRINGS`，smoke 目录那份是 214 行旧拷贝，三条都没有，于是 `PREFIX_SFT_FAIL FLEET`。更严重的是 CANON（`examples/swe_smith/agents/smith_agent.py`）也漂到了只认 ` ```bash ` 的 1016 行版本：`_query` 仍 `skip_special_tokens` 默认 True。134 那次评测用的是公开仓库里的 1223 行 harness——MiniCPM5 的 `<function>/<param>` 是特殊 token 18/19/20/21，默认反分词会删掉它们，harness 把本来合法的调用判成 format error（§54/§55）。**用旧 harness 评前缀 SFT 不能和 134 比。**
+
+修复：把 `agl-agentic-rl/swe_smith/{agents/smith_agent.py,harness/smith_rollout.py}` 拷回 smoke 和 CANON，再开 `val_sft_prefix`。`parse_action` 仍然只把 bash fence 和 MiniCPM 原生 bash 函数当成同一种动作，不接受 Qwen 的 `tool_calls`。
+
+HMPO 有一个真 bug：`train_smith_agent.py` 里的 `algorithm.hmpo` **VERL 不读**。真开关是 `SMITH_HMPO=1`（agent 交 0/1 + `n_turns`，跳过全局 t0 和 prompt 长度惩罚）加上 `agl_rollout_manager.apply_hmpo_to_completed`（按 `data_id` 组、正确轨迹中位长度做预算，做错恒 0）。`rollout.n` 已是 8。没接到 manager 就开训，只会跑二元 GRPO。
+
+先前 GKD1 108 / PG-OPD1 119 对照 134 更差或 n.s.，那次教师是 **带金标 patch hint 的 ep3**，不是「师生各自 rollout」。明天若 SFT/HMPO 都没增益，按新口径重做同词表蒸馏：学生用 MiniCPM SFT（前缀或 ep3，看谁评测更好），教师用**没训过的原版 MiniCPM5-2B**（123/474，弱于 134，有把学生往回拉的风险，必须写进笔记），损失是逐 token 软标签 KL，以及师生都 rollout 的 GKD / PG-OPD。
+
+验收数字只认 val-474 vs `val_sft3_tmpl2` 134 的 McNemar。Qwen 不当教师。

@@ -1148,6 +1148,9 @@ def main() -> int:
     # Long-turn penalty (plan A): penalize only SOLVED *training* rollouts for
     # burning turns; validation reward stays unshaped (drives ckpt selection).
     # Train mode is the /mode/train/ marker in the base URL (fail-safe to val).
+    # SMITH_HMPO=1 skips this global t0 ramp AND the prompt-length penalty so
+    # the trainer sees raw 0/1 + n_turns; group-median HMPO is applied in
+    # agl_rollout_manager.apply_hmpo_to_completed. Default off = eval unchanged.
     is_train = "/mode/train/" in base_url
 
     # Dense TRAINING reward: the F2P pass ratio instead of solved-or-not. With a
@@ -1163,26 +1166,25 @@ def main() -> int:
     f2p_partial = os.environ.get("SMITH_F2P_PARTIAL", "1") == "1"
     reward = f2p_ratio if (is_train and f2p_partial) else binary
     raw_reward = reward
+    use_hmpo = os.environ.get("SMITH_HMPO", "0").lower() in ("1", "true", "yes")
     len_pen_t0 = int(os.environ.get("SMITH_LEN_PEN_T0", "80"))
     len_pen_lambda = float(os.environ.get("SMITH_LEN_PEN_LAMBDA", "0.1"))
-    reward = length_penalized_reward(reward, n_turns, max_turns, t0=len_pen_t0, lam=len_pen_lambda, is_train=is_train)
-
-    # Prompt-length penalty (plan B): stack a context-bloat penalty on the same
-    # SOLVED-train gating, keyed on the rollout's largest prompt_tokens.
     prompt_pen_soft = int(os.environ.get("SMITH_PROMPT_PEN_SOFT_START", "50000"))
     prompt_pen_hard = int(os.environ.get("SMITH_PROMPT_PEN_HARD_CAP", "64000"))
     prompt_pen_max = float(os.environ.get("SMITH_PROMPT_PEN_MAX", "0.1"))
     if is_train and max_prompt_tokens >= prompt_pen_hard:
         log.warning("max_prompt_tokens=%d >= hard_cap=%d (context near budget)", max_prompt_tokens, prompt_pen_hard)
-    reward = prompt_length_penalty(
-        reward,
-        max_prompt_tokens,
-        soft_start=prompt_pen_soft,
-        hard_cap=prompt_pen_hard,
-        max_pen=prompt_pen_max,
-        is_train=is_train,
-        solved=resolved,
-    )
+    if not use_hmpo:
+        reward = length_penalized_reward(reward, n_turns, max_turns, t0=len_pen_t0, lam=len_pen_lambda, is_train=is_train)
+        reward = prompt_length_penalty(
+            reward,
+            max_prompt_tokens,
+            soft_start=prompt_pen_soft,
+            hard_cap=prompt_pen_hard,
+            max_pen=prompt_pen_max,
+            is_train=is_train,
+            solved=resolved,
+        )
 
     log.info(
         "done: mode=%s submitted=%s patch=%dB reward=%.3f raw_reward=%.3f binary=%.1f f2p_ratio=%.4f "
