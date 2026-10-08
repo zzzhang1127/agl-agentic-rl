@@ -3929,3 +3929,24 @@ s4（§62）已经实证：同样做对时，轮数罚是组内最稳的信号�
 6. `/` 与数据盘水位、不杀邻进程、不删 SFT ep3 / `ckpt_step5722.pt`，仍有效。
 7. 实验记录的家是本仓库 `docs/pitfalls-and-lessons.md`，不是 microsoft/agent-lightning。公开仓库脱敏：个人目录写成 `/workspace`，邻进程写成 `<neighbour-process>`。
 8. `gh` 装在 `~/.local/bin`，不在默认 PATH；推送用绝对路径或先 `export PATH="$HOME/.local/bin:$PATH"`。
+## §77 格式门过了；最短成功前缀在长轨迹上把 40 步压到约 4 步(2026-10-08)
+
+两件事并行，数字都还不是终值。
+
+**Qwen 教师格式。** 8 题格式烟测：`format_abort=0`、最后一轮感叹号坍缩=0，门过了才开新的 val-474 目录（旧适配跑的 474 作废，不混）。新 474 开跑后前几十题仍是 `format_abort=0`。对照未适配 406/474 中止、旧适配约 123/163 中止。根因仍是 §72：`smith_rollout` 把 temperature 写成 1.0，教师代理必须把请求打回 0.6 并截停 `!!!!`。**现在还不能报 Qwen 的 resolved，也不能宣布教师资格**——资格只认全量 474 对 ep3 134 的 McNemar。
+
+**MiniCPM 侧按计划走阶段 1，不等 Qwen 过门。** flash 已是合格教师（286/474）。`status.json` 常常没有 messages，训练数据用已经拼好的 train jsonl（3878 条 resolved）。做法：
+
+- ≤15 轮的成功轨迹原样留（short15 留过的那批，补上缺失的 submit 句）
+- \>15 轮的在干净容器里**线性**回放编辑步（`eval(k)` 不单调，不能二分），保留最小仍能 pytest 过的前缀，并补一条 `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
+- 改测试 / git / 联网的丢掉（本批 347 条 `forbidden_action`）
+- 验证集轨迹不进 SFT
+
+头几十条长轨迹已经回放完：原长中位数 40 轮，最短前缀中位数 **4**，最后一轮都是 submit。这就是 §74 说的「短15 扔掉的是已经修好、后面在逛」的那些轨迹。SFT 仍从 ep3、1 epoch、lr 5e-6；GPU 配方还是 4 卡，要等 Qwen 评测放出卡才能开训。HMPO / 二次尝试 / 序列级 OPD 仍然有闸：SFT 相对 134 不显著就不开。
+
+**经验**：
+
+1. 教师格式门和最短前缀可以并行；前者决定 Qwen 能不能进下一轮数据，后者现在只用 flash。
+2. 回放脚本必须挂上 `instance.json` + `eval_inside.py`，先藏 `.git` 再评，且**不能** `set -e`（教师轨迹里失败的 `ls`/`grep` 本来就不会停）。stdout 是 indent 过的 JSON，不能只 `json.loads` 最后一行。
+3. 截到编辑步之后一定要补 submit，否则学生学会「改完就停」。
+4. `/data` 的 `df` Available=0 往往是 root 预留块，size−used 仍可能大于 50G。没有 `global_step_*.tmp` 就不要删已经落盘的失败 SFT 权重。
