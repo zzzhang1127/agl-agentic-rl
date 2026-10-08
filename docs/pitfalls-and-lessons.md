@@ -3994,3 +3994,9 @@ pod 先全部 Pending。节点从 10-05 起带 `node.kubernetes.io/disk-pressure
 第一批 rollout 的输出能解析、能执行。抽了 29 条已经写完的日志：每条都有 `turn=N cmd=... rc=0`，29 条里 12 条 binary 奖励为 1，轮数从 3 到 40。这不是格式崩溃。
 
 权重一次都没更新。32 条轨迹收齐后，actor 算 old log-prob 断言失败：`max_token_len=8192`，实际合并轨迹 `max_seq_len=131072`。轨迹上限是 prompt 65536 + response 65536，刚好顶满。重启时把合并后的 prompt/response 都收成 8192，actor 的 `ppo_max_token_len_per_gpu` 设成 16384，checkpoint 目录用命令行钉死，避免 `.env` 把 `AGL_CKPT_DIR` 盖回旧目录。超长轨迹的后半会被截断，奖励仍记在保留下来的 token 上。这一截还没走完一个 optimizer step。
+
+## §81 HMPO 第 1 步已经更新权重(2026-10-09)
+
+§80 里收短轨迹之后的那次启动，第 1 步走完了 optimizer。32 条 rollout 都有 trace、都有奖励，没有整行被丢掉。`training/reward` 平均 **0.59375**（19/32 为 1）。advantage 不是全 0：最大 2.47，最小 −2.47。`actor/pg_loss` 约 −7.7e-6，`grad_norm` 约 0.072。不是 NaN，也不是一次大步。`kl_loss` 这一步记成 0，和第 1 步策略还贴着参考模型一致。
+
+16/32 的合并 response 顶到 8192 被截断（`response_length/clip_ratio=0.5`）。短轨迹完整留下，长轨迹的后半不进 loss。这一步先让更新发生；截断比例如果一直这么高，下一步再把 response 上限加大，而不是在第 2 步 rollout 中途重启。
