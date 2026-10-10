@@ -31,7 +31,7 @@ swe_smith/
   containers/     SWE-smith 任务镜像的规划与预拉
   opencode_lineage/  更早的 OpenCode-harness 血统（v2–v4）与它的教师流水线，已被 smith harness 取代
 patches/          对 agent-lightning 核心库的 diff（+1016/−49）、配套单测、verl dp_group 补丁
-docs/             踩坑与经验（§1–§85，按「现象 → 根因 → 解决 → 经验」写）
+docs/             踩坑与经验（§1–§86，按「现象 → 根因 → 解决 → 经验」写）
 ```
 
 ## 方法概览
@@ -71,3 +71,4 @@ trainer 与 vLLM 推理共置在同一组 GPU 上，每步先 rollout 再更新�
 - RL 对照仍是 ep3 的 134/474。HMPO 第 46 步 135/474，p=1，没有续训（§83）。
 - 2026-10-10 起，蒸馏对照改为官方 MiniCPM5-2B-SFT 的 92/474。硬标签 **126/474**（p=0.0002），软标签 **121/474**（p=0.0003），OPD 最高 116/474。这是自蒸馏，不是 RL。当天数字在 [`docs/pitfalls-and-lessons.md`](docs/pitfalls-and-lessons.md) §84。
 - 跑完的训练和评测至少每天补一节。第 8 轮 OPD 是 113/474，低于 114，第 9 轮未训。从原版 MiniCPM5-2B 起的同一套硬标签是 132/474，相对基座记录的 123 多 9 题（§85）。
+- 这些 40 轮分数不能当作 100 轮的对照。官方上限是 100 轮。100 轮重评已经开始，总数出来之前不报新的正确率（§86）。
