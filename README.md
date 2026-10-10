@@ -2,7 +2,7 @@
 
 > Agentic RL on top of [microsoft/agent-lightning](https://github.com/microsoft/agent-lightning) (verl + GRPO):
 > one single-turn run that works (GSM8K, +15.6 pp on the full test set), one multi-turn coding-agent run
-> (SWE-smith, 2.5B model) that has **not** produced a real gain yet, and everything built along the way —
+> (SWE-smith, 2.5B model) whose RL lines still have no significant gain versus SFT ep3 (134/474), while distillation from the official SFT checkpoint (92/474) reached 126 and 121 on 2026-10-10 (see §84), and everything built along the way —
 > framework patches, collapse probes, the official-harness evaluation fleet, a teacher-distillation pipeline, and
 > a 3 800-line lab notebook of what went wrong and why. Numbers below are reported as measured; nothing is cherry-picked.
 
@@ -14,7 +14,7 @@
 | **SWE-smith**（多轮 coding agent） | MiniCPM5-2B（2.5B，Llama 架构） | 官方 smith harness + GRPO，五条血统 s1–s5 | 134/474 | s5 step 10：132/474（p=0.90）；step 20：135/474（p=1.00），暂停于 step 20 转蒸馏 | 无显著增益 | 固定 474 题验证集，temperature 0.6，真实上限 470（4 题的镜像任何模型都做不出）；此前四条血统要么平线要么坍塌，根因都已定位（见下） |
 | **SWE-smith 蒸馏** | 基座 → 教师轨迹 SFT | deepseek-v4-flash 轨迹，只留做对的题 | 基座 123/474 | SFT ep3 127/474（同一旧模板，差异不显著）；模板修复后重测 134；b5 续训 1 epoch 后 **126/474**（p=0.36）；b6 再续 1 epoch 后 **118/474**（vs 134，McNemar p=0.056）；只用 ≤15 轮教师轨迹从 ep3 续 1 epoch（short15）**120/474**（p=0.10） | 三轮都低于 ep3，无增益 | 这是蒸馏口径，不是 RL 增益；第 5 批 707 条、第 6 批 3878 条（全训练集采完，互斥）；**失败模式是交卷率下滑**：40 轮内提交的题 240→205→164，提交者的正确率反而 56%→72%，即学生学到了教师「多探索再交」的风格却收敛不了（见 swe_smith/README） |
 
-截至 2026-10-08。两条线的详细结果、血统表和根因见 [`gsm8k/README.md`](gsm8k/README.md) 与 [`swe_smith/README.md`](swe_smith/README.md)。
+截至 2026-10-10。两条线的详细结果、血统表和根因见 [`gsm8k/README.md`](gsm8k/README.md) 与 [`swe_smith/README.md`](swe_smith/README.md)。
 
 ## 仓库结构
 
@@ -31,7 +31,7 @@ swe_smith/
   containers/     SWE-smith 任务镜像的规划与预拉
   opencode_lineage/  更早的 OpenCode-harness 血统（v2–v4）与它的教师流水线，已被 smith harness 取代
 patches/          对 agent-lightning 核心库的 diff（+1016/−49）、配套单测、verl dp_group 补丁
-docs/             踩坑与经验（§1–§77，按「现象 → 根因 → 解决 → 经验」写）
+docs/             踩坑与经验（§1–§84，按「现象 → 根因 → 解决 → 经验」写）
 ```
 
 ## 方法概览
@@ -68,7 +68,6 @@ trainer 与 vLLM 推理共置在同一组 GPU 上，每步先 rollout 再更新�
 
 ## 之后会更新什么
 
-- s5 两次探针平线后已暂停。教师轨迹 SFT（b5/b6/short15）与拒绝采样 RFT1/RFT2（130/127）都没有可报增益。特权信息：金标 patch 在 100 题诊断上是 64 vs 24，但可训练的 tests/files 几乎不动；训出的 OPSD2/GKD1 为 109/108，低于 ep3 134。原配方不再续训。
-- 同一 harness 参照：官方 MiniCPM5-2B-SFT **92/474**；MiniCPM5-1B **0/474**（256 题格式中止）；Qwen3-8B 零样本 22/474；Qwen3.6 未适配 **100/474**（406 题格式中止）。适配成 bash fence 后 32 题与 ep3 打平（8/32），全量 474 教师资格评测进行中（见 §72–§73）。不训 Qwen。
-- short15 证明「全局轮数硬切」只提高交卷率、降低交对率。下一步若教师资格过门（或退回 flash 286），用**最短成功前缀**（线性扫描，不能二分）从训练集轨迹做 1 epoch SFT，而不是再灌长轨迹。HMPO / 二次尝试 / 序列级 OPD 都有闸门，见 §75–§76。
-- `docs/pitfalls-and-lessons.md` 持续追加。
+- RL 对照仍是 ep3 的 134/474。HMPO 第 46 步 135/474，p=1，没有续训（§83）。
+- 2026-10-10 起，蒸馏对照改为官方 MiniCPM5-2B-SFT 的 92/474。硬标签 **126/474**（p=0.0002），软标签 **121/474**（p=0.0003），OPD 最高 116/474。这是自蒸馏，不是 RL。当天数字在 [`docs/pitfalls-and-lessons.md`](docs/pitfalls-and-lessons.md) §84。
+- 跑完的训练和评测至少每天补一节。第 8 轮 OPD 评测、第 9 轮是否开训，以及从原版 MiniCPM5-2B 起的同一套硬标签，写进下一节。

@@ -59,3 +59,7 @@ Job 模板加了 toleration 与 critical 优先级，闩着也不影响训练。
 
 2026-09 用 OpenCode 作为 harness 训了 v2–v4（含采集率 8.1% 的 bug 发现与修复、步数预算、上下文压缩切分），
 step 62 全量 136/474 vs 基座 139，无增益；随后转教师蒸馏，再转官方 smith harness。代码原样保留供对照，不再维护。
+
+## 2026-10-10
+
+上面 b5/b6/short15 仍是从 ep3 续训、对照 134 的结论。同一天另有一组从官方 MiniCPM5-2B-SFT（92/474）起的自蒸馏：DeepSeek 硬标签 **126/474**（p=0.0002），原版 MiniCPM 软标签 **121/474**（p=0.0003），OPD 最高 116/474。对照是官方 SFT 的 92，不是 ep3 的 134。配置和当天还在跑的评测见 [`docs/pitfalls-and-lessons.md`](../docs/pitfalls-and-lessons.md) §84。
