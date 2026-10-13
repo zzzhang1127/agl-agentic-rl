@@ -4114,3 +4114,17 @@ Qwen3.5-9B 的验证没有停。服务器上没有 Qwen3.6-9B。两套 vLLM 都�
 2. Ray worker 实际 import 的 `agentlightning.__file__` 是预期版本；
 3. AGL/vLLM response token ids 与 logprobs 同源，不再重编码；
 4. FSDP/NCCL env 在 worker 内生效，再谈 4 卡训练和 checkpoint。
+
+## §91 SAO critic smoke 卡在“干净奖励 + 可合并轨迹 + 显存”三重门槛（2026-10-13）
+
+本轮 SAO critic smoke 已确认几件事：critic attention 冻结能在 4 卡 FSDP 初始化阶段生效，日志里有 `CRITIC_ATTENTION_FREEZE` 审计；token/logprob 不再走重编码；NCCL 的 `CUMEM/IB/NVLS/MNNVL` 环境变量需要显式进入 Ray worker runtime_env。attempt6o 已经完成过一个 critic update，出现 `critic/vf_loss` 和 `critic/grad_norm`，说明 critic 更新链路本身能走通。
+
+新的坑是 checkpoint 和 actor 逻辑。critic-only warmup 下不能保存 actor checkpoint，也不能因为 `critic_warmup <= global_steps` 进入 actor update。已把 actor update 改成显式 `actor_update_allowed()` 互锁：`critic_only=True` 永远不更新 actor；保存 checkpoint 时也跳过 actor，只保存 critic 和 dataloader 状态。否则 smoke 会在 actor 保存阶段 OOM 或写半截 `global_step_*.tmp`。
+
+奖励链路不能把 `reward_eligible=False` 的 rollout 当 0 奖励训。attempt6p 被单个 rejected rollout 中断后，改成 reward guard 逐条过滤：保留 `reward_eligible=True && evaluation_state=complete` 的轨迹，拒绝 runner_error、timeout、incomplete_or_invalid_log 等不可用奖励。attempt6q 证明这个保护有效：如果整批全是脏奖励，就 fail closed，不训练 critic。
+
+GAE trajectory 还要求多轮 trace 能按 token 前缀合并。attempt6s 发现部分 rollout 存在 prefix mismatch，直接训练会缺少跨行 value linkage。已改为在 GAE 模式下跳过 prefix mismatch rollout，并记 `training/n_rollouts_skipped_prefix_mismatch`，避免把不连贯轨迹硬塞进 GAE。
+
+上下文问题仍未彻底解决。`max_model_len=51200` 在 4 卡 actor/ref/critic 常驻时 vLLM KV cache 不够；`24576 + 4096/2048 completion` 能启动，但 OpenCode 仍会偶发请求超过窗口。把 pod 侧 `AGL_OPENCODE_CONTEXT` 从 24576 降到 20480 只能减少溢出，不能保证所有题都不过界。
+
+最后因为同事紧急需要 CUDA 5，本会话启动的 attempt6t 已手动停止，Ray/vLLM/WorkerDict 进程已清掉。当前不能再用 CUDA 5 继续 smoke；下一次要么等 4 张大空闲卡恢复，要么改成 2 卡更小 smoke 验证 critic-only checkpoint，不要抢同事的卡。
