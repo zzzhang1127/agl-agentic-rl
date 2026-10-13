@@ -4092,3 +4092,25 @@ Qwen3.5-9B 的验证没有停。服务器上没有 Qwen3.6-9B。两套 vLLM 都�
 没训过的原版 `MiniCPM5-2B`，40 轮记录是 123/474，100 轮是 **126/474**。多出的 3 题同样来自轮次上限，不是新训练。若拿它和官方 SFT 的 100 轮 **100/474** 配对，新做对 40，丢掉 14，差 +26，McNemar 精确 p=0.0005。这是基座相对官方 SFT 的分数，不是蒸馏增益。交卷 385，打满 100 轮 40，轮次中位 34，超时 0，上下文溢出 30。
 
 从这份基座做 DeepSeek 硬标签的那份权重，100 轮评测还在跑。它的对照应是同协议下基座的 **126/474**，不是 40 轮记录的 123，也不是官方 SFT 的 100。
+
+---
+
+## 13. SAO critic smoke：Ray 代码分发、token 对齐与 NCCL 环境变量不是一回事（2026-10-13）
+
+**背景**：从 GRPO/蒸馏/OPD 转到 SAO/PPO 式路线后，当前主线是先训 critic：actor 固定为原始 MiniCPM5-2B，critic attention 冻结，只训练非 attention（MLP/value head 等），奖励链路和 token/logprob 对齐验证通过后再考虑 actor 更新。
+
+**已确认修复 1：vLLM token/logprob 对齐。** vLLM 0.8.5 的 chat completion 不会原生返回 `choice.token_ids`；旧代码用 tokenizer 重编码 assistant 文本，遇到 MiniCPM/OpenAI tool XML/JSON 流时，`token_ids` 是“解析后文本”的 token，而 `logprobs` 是“原始生成流”的 token，长度和位置都错。正确做法是在训练请求里打开 `return_tokens_as_token_ids=True` 且 `top_logprobs=0`，然后从 `logprobs.content[*].token == "token_id:N"` 解析采样 token id，绝不能再重编码 response 文本。该修复已在 `code_v6*` smoke 包中部署，本地单测 `test_sampled_token_ids.py` 通过。
+
+**已确认修复 2：checkpoint 原子替换已经在 PPO trainer 里。** `AgentLightningRayPPOTrainer._save_checkpoint()` 已有 staging `.tmp` → validate → rename/replace → tracker 原子写入 → prune 的逻辑；本轮不再重复发明保存器。当前 smoke 配置把 `save_freq=2`，按实测 step 时间折算到约半小时一存，后续长跑再按真实 step 时长调整。
+
+**坑 1：Ray worker 不是直接用当前脚本的 `sys.path`。** attempt6/6b 在主进程用 `code_v6*` 快照启动，Ray worker 却从服务器 checkout `/data/zhizhong/projects/agent-lightning` import `agentlightning`，导致 `ModuleNotFoundError: agentlightning.verl.critic_worker` 或反序列化找不到新类。只改快照目录不够，Ray remote class 的 module 路径必须在 worker 侧也可 import。临时解决：把 `entrypoint.py`/`critic_freeze.py` 同步到服务器 checkout，或显式设置 Ray `runtime_env`/`working_dir`，不能依赖主进程 `sys.path.insert()`。
+
+**坑 2：把自定义 worker 类放在单独新文件里容易踩 Ray 反序列化。** attempt6b 里 `_AglTaskRunner` 能跑起来，但 worker import `agentlightning.verl.critic_worker` 失败；attempt6c 改成动态 mixin 后，又因为 worker 仍加载旧 checkout 而报 `Can't get attribute AttentionFrozenCriticWorkerMixin`。经验：Ray remote/actor 用到的新类最好放在 worker 一定会加载的稳定 module 中，并确认远端进程打印的 `__file__` 是预期路径。
+
+**坑 3：NCCL 兼容环境变量必须进入 Ray worker runtime_env。** attempt6e/6f 已经进入 critic FSDP 初始化，说明 Ray import 问题解决；但在 FSDP `_sync_module_params_and_buffers` 阶段报 `ncclUnhandledCudaError: Cuda failure 1 'invalid argument'`。脚本主进程设置 `NCCL_CUMEM_ENABLE=0`、`NCCL_IB_DISABLE=1` 不代表 Ray worker 一定继承；VERL 的 `get_ppo_ray_runtime_env()` 会构造自己的 env，已有同名环境变量还可能被过滤掉。后续尝试要把这些 NCCL 变量显式写进 `ray_kwargs.ray_init.runtime_env.env_vars`，并在 worker 日志里验证，而不是只看 launcher 脚本。
+
+**经验**：SAO critic smoke 的启动验证要分四层打勾：
+1. 代码快照 hash/单测通过；
+2. Ray worker 实际 import 的 `agentlightning.__file__` 是预期版本；
+3. AGL/vLLM response token ids 与 logprobs 同源，不再重编码；
+4. FSDP/NCCL env 在 worker 内生效，再谈 4 卡训练和 checkpoint。
