@@ -3877,6 +3877,20 @@ MDE +18。判 CONTINUE_WARN:在噪声量级内,既不是增益也不构成「明
 
 随后按特权信息训出的权重（蒸馏口径，不是 RL）全量 474：OPSD2 **109/474**（交卷 280），GKD1 **108/474**（交卷 258），对照 ep3 134。方向是跌。OPSD1 一次全量 0/474 是失败跑（采集/格式崩了），不当对照。
 
+**里程碑（`hint_diag/milestones.py`，金标 `gold_val/`474 + `gold_train/`6338）**：ep3 轨迹里 80% 改到金标文件、77% 命中金标 hunk，P(res|hunk)=0.35 vs 0.28（lift 1.24×）；失败主因「找对地方改错」237/474（50%），导航失败约 19%。交卷 P(res|sub)=0.48 vs 0.08 最强但是结果近端；hint=tests 把「跑过 F2P」从 13% 拉到 45% 而正确率不动（23 vs 24）。**导航/验证类过程奖励对 2B 没有杠杆。**
+
+**PG-OPD 离线实现（`swe_smith_smoke/opsd/`）**：教师 = 同权重 ep3 + 第一条 user 里插金标补丁 `<hint>`（与评测侧 `build_hint` 逐字同），学生 = 无 hint；轨迹 = RFT 链采的 2400 条学生自采（做对做错都用）；逐 token A_t = log π_T − log π_S，损失 −Σ A_t log π / N（reverse-KL 的 REINFORCE 估计；A≡1 退化成 SFT，单测恒等）；RMS 归一 + 截 ±3；从 ep3 1 epoch lr 5e-6。变体 opsd1 signed / opsd2 pos(A=max(A,0))。踩坑：
+
+1. **优势不能塞进 loss_mask**：verl fsdp 引擎 `transformer_impl.py:575` 用 `loss_mask.sum()` 当 `batch_num_tokens`（再 all_reduce），改 mask 等于改分母。走独立张量键 `adv`：`SFTTensorCollator` 对所有 tensor 键做 jagged nested，`rearrange_micro_batches` 原样切分；`sft_trainer.py:163` 的 `sft_loss` 是 `_build_engine` 里局部 import，启动器 `import verl.workers.utils.losses as _losses; _losses.sft_loss = opd_loss` 即可替换。
+2. 教师 logprob 用 HF 前向单独算（bf16 + flash-attn2）：`model.model(...)` 拿 hidden 后 lm_head **按 4096 分块**——130560 词表 × 49152 长度的整块 logits 约 26 GB fp32；分块与整模 forward 逐位同。hint 文本重建必须逐字同：`--selfcheck` 对 `val_hint_patch` 的 `status.hint_chars` 100/100 等长。
+3. **E[A] = −KL(π_S‖π_T) ≤ 0 是数学必然**（y 由学生采），均值 −0.032 不是 bug。信号全在尾巴：p25/p75 ≈ ±0.001，p5 −0.19、p95 +0.095。
+4. **尾巴 95–97% 落在 THOUGHT 推理文本**，落在命令首 token 的只 0.3–0.4%：教师给的是「修法假设对不对」，不是「该敲哪条命令」。序列均值 AUC(resolved vs not) 约 0.375；早期轮次偏负（−0.064 vs 后段 −0.009），所以才加 pos 变体。
+5. 单测陷阱：verl 的 `torch.roll(loss_mask.values(), -1)` 在**打包后的平铺值**上滚，序列 i 的最后一个 log_prob 会乘上序列 i+1 的 mask[0]；伪造 batch 时 `m[0]=0`。
+6. `kill <setsid nohup 的 bash 包装 pid>` 只杀包装，python 子进程还活着；要 `pgrep -f` 到 python 本体。
+7. **loss_fn 返回的自定义 metrics 到不了 swanlab**：swanlab 0.7.20 对 list 值不抛异常、只打一行 "Data type error ... in the list" 然后丢掉图表。启动器里再包一层 `Tracking.log`，把嵌套 list 归约成均值再下发（`sft_trainer_opd.py`）。**「不会报错」和「记到了」是两回事。**
+
+**长 rollout 稀释（文献速记）**：组内细粒度重分配 / 树状前缀共享 / 势能回传 / 截短 / 先 RFT 后 RL；2B+40 轮+600s 现实可做的是截短（ESR）与 RFT 先行。夜间链：RFT `rft1/drive_rft1.sh` → `opsd/drive_opsd.sh` opsd1(signed) → opsd2(pos)。
+
 跨词表的 **token 级 reverse-KL（MOPD）做不了**：MiniCPM 词表 130560，Qwen 不是同一套 id。能做的只有序列级 `log P_T(y)`（学生采样 → 反分词成文本 → 教师打整段 logprob），代码在 `swe_smith/distillation/seq_opd_score.py`。前提仍是教师本身显著强于 ep3。
 
 **经验**：先测「泄漏答案的上限」，再测「训练时真能拿到的特权」。上限高但可训练特权不动，就不要开 OPSD。OPSD/GKD/RFT 一律标「自蒸馏 / 蒸馏」，不要写成 RL。
