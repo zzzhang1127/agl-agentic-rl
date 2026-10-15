@@ -1,86 +1,105 @@
 # agl-agentic-rl
 
-> Agentic RL on top of [microsoft/agent-lightning](https://github.com/microsoft/agent-lightning) (verl + GRPO):
-> one single-turn run that works (GSM8K, +15.6 pp on the full test set), one multi-turn coding-agent run
-> (SWE-smith, 2.5B model) whose RL lines still have no significant gain versus SFT ep3 (134/474), while distillation from the official SFT checkpoint (92/474) reached 126 and 121 on 2026-10-10 (see §84), and everything built along the way —
-> framework patches, collapse probes, the official-harness evaluation fleet, a teacher-distillation pipeline, and
-> a 3 800-line lab notebook of what went wrong and why. Numbers below are reported as measured; nothing is cherry-picked.
+**基于 Agent Lightning、verl 与 vLLM 的强化学习与蒸馏实验工程。**
 
-用 Agent Lightning（下称 AGL）做 agentic RL 的全部工程记录。两条线：
+本项目围绕一个问题展开：如何把可验证奖励下的单轮训练，推进到长轨迹、工具调用和隔离执行环境中的 coding agent 训练？工作覆盖训练采集、评测、教师轨迹蒸馏、故障诊断，以及固定 actor 的 PPO critic 预热。
 
-| 任务 | 模型 | 方法 | 基线 | 训练后 | 统计 | 口径与必须说明的事 |
-|---|---|---|---|---|---|---|
-| **GSM8K**（单轮） | Qwen2.5-1.5B-Instruct | 官方示例 GRPO，n=4，lr 1e-6 | 62.55%（825/1319） | **78.17%**（1031/1319，step 1550） | 两比例 z=8.78 | 全量 test 1319 题，精确匹配；**未开 KL**（官方默认 `use_kl_loss=False`）；step 1550 不是峰值（峰值在 800–1000 步附近，ckpt 被 `keep=2` 轮掉）；单轮 RLVR，不是多轮 agentic |
-| **SWE-smith**（多轮 coding agent） | MiniCPM5-2B（2.5B，Llama 架构） | 官方 smith harness + GRPO，五条血统 s1–s5 | 134/474 | s5 step 10：132/474（p=0.90）；step 20：135/474（p=1.00），暂停于 step 20 转蒸馏 | 无显著增益 | 固定 474 题验证集，temperature 0.6，真实上限 470（4 题的镜像任何模型都做不出）；此前四条血统要么平线要么坍塌，根因都已定位（见下） |
-| **SWE-smith 蒸馏** | 基座 → 教师轨迹 SFT | deepseek-v4-flash 轨迹，只留做对的题 | 基座 123/474 | SFT ep3 127/474（同一旧模板，差异不显著）；模板修复后重测 134；b5 续训 1 epoch 后 **126/474**（p=0.36）；b6 再续 1 epoch 后 **118/474**（vs 134，McNemar p=0.056）；只用 ≤15 轮教师轨迹从 ep3 续 1 epoch（short15）**120/474**（p=0.10） | 三轮都低于 ep3，无增益 | 这是蒸馏口径，不是 RL 增益；第 5 批 707 条、第 6 批 3878 条（全训练集采完，互斥）；**失败模式是交卷率下滑**：40 轮内提交的题 240→205→164，提交者的正确率反而 56%→72%，即学生学到了教师「多探索再交」的风格却收敛不了（见 swe_smith/README） |
+这里既保留有效结果，也保留未获得增益的实验及其排查证据。算法与模型基于上游工作，项目重点是训练系统的可靠性、可复现的实验对照和对失败模式的分析。
 
-截至 2026-10-10。两条线的详细结果、血统表和根因见 [`gsm8k/README.md`](gsm8k/README.md) 与 [`swe_smith/README.md`](swe_smith/README.md)。
+**技术栈：** Python · PyTorch · Agent Lightning · verl · vLLM · FSDP · Ray · Kubernetes / Docker · SwanLab
 
-## 仓库结构
+[实验结果与口径](docs/results.md) · [复现指南](docs/reproduction.md) · [文档索引](docs/README.md) · [实验笔记](docs/pitfalls-and-lessons.md)
 
+## 结果概览
+
+以下结果截至 **2026-10-15**。SWE-smith 使用 MiniCPM5-2B 系列模型和固定 474 题验证集；不同起点、轮次预算的结果分别报告。
+
+| 实验线 | 对照 → 结果 | 可以得出的结论 |
+|---|---|---|
+| GSM8K · Qwen2.5-1.5B-Instruct · GRPO | 825/1319 → 1031/1319，**62.55% → 78.17%** | 全量 test 提升 **15.62 个百分点**；单轮可验证奖励训练 |
+| SWE-smith · 官方 SFT 起点 · 40 轮蒸馏 | 92/474 → 硬标签 **126/474**、软标签 **121/474** | 同协议下有提升；属于蒸馏，不能归为 RL 增益 |
+| SWE-smith · 官方 SFT 起点 · 100 轮重评 | 100/474 → 硬标签 **117/474**、软标签 **119/474** | 软标签配对 p=0.0271；硬标签 p=0.0568，未达 0.05 |
+| SWE-smith · ep3 起点 · GRPO s5 | 134/474 → **135/474** | 配对 p=1.00，未观察到显著提升 |
+| SAO/PPO · critic-only | 恢复、更新、保存链路通过；value 解释方差仍负 | **工程验收通过，质量未达标，actor 保持禁用** |
+
+完整分母、训练起点、评测预算、统计方法与限制见 [结果页](docs/results.md)。这些是本项目的实验读数，不是统一条件下的模型排行榜。
+
+## 核心工程工作
+
+### 1. 让训练样本忠实于实际生成
+
+修复多轮采集中的工具调用丢失、chat-template 参数透传和轨迹合并问题；critic 线进一步核对 sampled token IDs 与 behavior logprobs，保留包含工具结果的完整 response span。缺失奖励、基础设施失败和无法对齐的轨迹直接拒绝，不伪装成零奖励。
+
+入口：[框架补丁](patches/README.md) · [critic 代码包](swe_smith/critic_warmup/README.md)
+
+### 2. 用对照实验判断收益，而非只看训练奖励
+
+实现固定验证集分片评测、逐题结果归档、配对比较、训练日志探针和奖励审计。区分模型起点、交卷率、轮次预算与真实正确率，记录训练奖励上涨但验证集不涨、长度惩罚诱导提前交卷等失败现象。
+
+入口：[SWE-smith 实验](swe_smith/README.md) · [配对比较脚本](swe_smith/harness/paired_cmp.py) · [诊断工具](swe_smith/probes/README.md)
+
+### 3. 跑通教师轨迹与 critic 训练闭环
+
+整理教师输出归一化、成功轨迹筛选、assistant-only SFT、软标签与 OPD 实验；新增冻结 critic attention、固定 actor 的 PPO/GAE 路径，验证原生 critic-only 恢复以及完整分片的原子发布与旧版清理。
+
+入口：[蒸馏与 SFT](swe_smith/README.md#蒸馏与-sft) · [critic 复现包](swe_smith/critic_warmup/README.md)
+
+### 4. 让共享 GPU 环境中的训练可诊断、可停止、可恢复
+
+使用独立运行目录、显式 GPU 选择、奖励与数值检查、磁盘保护和脱敏 tracking。critic 完整 checkpoint 约 22.2 GiB；稳定态只保留最新一份，原子保存期间为新旧两份预留空间。数据盘不足时停止，不转移到根分区。
+
+入口：[critic 工程验收记录](docs/critic-warmup-20261015.md)
+
+## 系统链路
+
+```mermaid
+flowchart LR
+    Task[任务与代码仓库] --> Agent[隔离容器中的 Agent]
+    Agent --> Proxy[AGL OpenAI 兼容网关]
+    Proxy --> Inference[vLLM 推理]
+    Proxy --> Trace[轨迹与 token / logprob 采集]
+    Agent --> Eval[隐藏测试与结构化评分]
+    Trace --> Guard[对齐与奖励校验]
+    Eval --> Guard
+    Guard --> Train[verl：GRPO 或 critic-only PPO]
+    Train --> Save[Checkpoint 与实验指标]
 ```
-gsm8k/            可复现的单轮 GRPO：启动脚本、全量评测脚本、曲线/显著性工具、评测日志
+
+GRPO 与 critic-only PPO 是独立实验线，补丁和配置不可混用；critic-only 路径不更新 actor。
+
+## 从哪里开始
+
+- **快速了解项目：** 本页 → [实验结果](docs/results.md) → [工程经验](docs/README.md)。
+- **复现单轮训练：** [GSM8K](gsm8k/README.md)，包含全量评测日志。
+- **查看多轮问题排查：** [SWE-smith](swe_smith/README.md)，按训练起点和历史实验线组织；另有[训练脚本导航](swe_smith/training/README.md)与[评测工具导航](swe_smith/harness/README.md)。
+- **验证 critic 代码：** [critic 包](swe_smith/critic_warmup/README.md)，可在指定干净上游 checkout 中应用补丁并运行回归测试。
+
+## 目录导航
+
+```text
+gsm8k/                 单轮 GRPO 启动、评测、曲线与结果日志
 swe_smith/
-  agents/         跑在任务容器里的 agent（官方 smith 协议：THOUGHT + 单个 bash 块）及其单测
-  training/       RL 训练入口、s5 启动脚本、k3s Job 模板、ConfigMap 刷新、数据集构造与筛题
-    lineages/     s1–s4 的启动脚本与模板（逐字保留，便于对照每条血统改了什么）
-  probes/         坍塌探针（训练日志 Tier-1 看门狗）、探针序列显著性、奖励审计、权重漂移
-  harness/        官方 harness 上的 474 题全量评测：vLLM 多卡 fleet、分片 sweep、配对显著性
-  distillation/   教师轨迹采集：OpenAI 兼容代理（归一化教师怪癖）、批次驱动、拒绝采样拼装
-  sft/            教师轨迹 SFT：与推理逐字相同的模板渲染、只盖 assistant 的 loss mask、启动脚本
-  containers/     SWE-smith 任务镜像的规划与预拉
-  opencode_lineage/  更早的 OpenCode-harness 血统（v2–v4）与它的教师流水线，已被 smith harness 取代
-patches/          对 agent-lightning 核心库的 diff（+1016/−49）、配套单测、verl dp_group 补丁
-docs/             踩坑与经验（§1–§90，按「现象 → 根因 → 解决 → 经验」写）
+  agents/              历史 smith agent 与解析/终止相关测试
+  training/            GRPO、HMPO 等历史训练配置与入口
+  harness/             分片评测、结果汇总和配对比较
+  probes/              坍塌探针、奖励审计与权重漂移
+  distillation/        教师采集、轨迹归一化与前缀实验
+  sft/                 SFT 数据渲染、准备与训练脚本
+  critic_warmup/       独立 critic 补丁配套的源码 overlay 与校验工具
+  containers/          任务镜像准备工具
+  opencode_lineage/    早期 OpenCode 实验归档
+patches/               按实验线区分的框架补丁
+docs/                  结果口径、复现说明、验收记录与历史笔记
 ```
 
-## 方法概览
+## 复现边界与当前状态
 
-AGL 的结构是：agent 在隔离环境里跑（这里是每道题一个 docker 容器，由 k3s Job 拉起），所有 LLM 调用经过
-AGL 的 OpenAI 兼容代理（`agl-server`），代理把 prompt/response 的 token 序列采集下来交给 verl trainer 做 GRPO；
-trainer 与 vLLM 推理共置在同一组 GPU 上，每步先 rollout 再更新。agent 代码本身不用改成「训练专用」，这是 AGL 的卖点，
-也是本项目大部分时间都花在哪里的原因：**采集链路上每一处「代理看到的序列 ≠ 模型真正看到的序列」都会悄悄把训练变成噪声**。
+这是实验代码与证据仓库，不是 Agent Lightning 的完整 fork。部分脚本保留实验时的路径和环境假设；模型权重、任务镜像、原始轨迹及凭据不随仓库提供。请先阅读 [复现指南](docs/reproduction.md)，不要直接运行历史运维脚本。
 
-本项目在框架层做的事（全部在 [`patches/`](patches/README.md)）：
+截至 2026-10-15，critic 最近执行到 step59，完整保存到 step40 后因磁盘保护停止；解释方差仍负。下一步是恢复有界训练，并用独立正负留出轨迹比较常数/初始化基线的 value 误差与校准，达到质量门槛后再讨论 actor 更新。
 
-- 修采集：工具调用轮被 chat template 渲染异常静默丢掉，采集率 8.1%；代理丢 `chat_template_kwargs` 导致多轮 episode 合并 89% 失败；chat 模板 `<think>` 不对称导致 episode 被打碎成「一轮一行」（前向浪费 18.3×）。
-- 加闸门：采集率低于阈值直接失败；一个 batch 零 LLM 调用直接失败；模板 preflight 不过不起训。
-- 训练器：DAPO 风格动态采样（零优势组整组丢弃并补采）、mini-batch 适配、行打乱、原子化 ckpt。
-- verl：`dp_actor` 漏传 `dp_group` 导致 NCCL all-gather 挂死 3600s 的补丁。
+## 上游与致谢
 
-在任务层做的事（[`swe_smith/`](swe_smith/README.md)）：稠密奖励（F2P 测试通过比例 + P2P 硬闸）、筛题、
-坍塌探针与「探针显著下降即停」的自动循环、固定 474 题的配对显著性评测、教师轨迹拒绝采样 SFT。
+基于 [Microsoft Agent Lightning](https://github.com/microsoft/agent-lightning)、[verl](https://github.com/volcengine/verl)、[vLLM](https://github.com/vllm-project/vllm) 和 SWE-smith 任务体系；GSM8K 训练入口沿用上游示例。本仓库记录实验特定的补丁、脚本与分析，不将上游能力或预训练模型贡献计为新的算法成果。
 
-## 复现
-
-1. 环境：按 AGL 官方文档装 `agent-lightning @ 218f1f7c` + verl 0.7.1 + vLLM 0.8.5（`swe_smith/training/setup_cu124.sh` 是本项目的安装脚本，CUDA 12.4），然后套 `patches/`。
-2. GSM8K：`gsm8k/run_gsm8k.sh`（训练）→ `gsm8k/eval_both_full.sh`（基座与 ckpt 的全量 1319 题评测）。
-3. SWE-smith：`swe_smith/training/download_dataset.sh` 拿官方数据集 → `containers/pull_images.py` 预拉镜像 → `training/refresh_agent_configmap.sh` → `training/restart_s5_smith_trainer.sh`；评测用 `harness/smith_fleet.sh` 起 vLLM，再 `harness/run_smith_sweep.py` 分片跑 474 题，`harness/paired_cmp.py` 做配对检验。
-
-脚本里的 `/workspace/...` 是脱敏后的占位路径（原始路径是服务器上的个人目录），按自己的目录改即可。
-
-## 脱敏说明
-
-公开前统一替换了：服务器个人目录 → `/workspace`，内网 IP/代理 → `<LAN_IP>`/`<CORP_PROXY>`，进程号 → `<N>`，
-同机其他用户与进程名 → `<other-user>`/`<neighbour-process>`，个人 HF/SwanLab 句柄 → `<hf-user>`/`<swanlab-run-url>`。
-所有密钥（教师 API、HF token）只以 `.env` 文件形式存在于服务器本地，从未入库，`.gitignore` 也拦住了它们。
-如果发现漏网的信息，请开 issue。
-
-## 之后会更新什么
-
-### 2026-10-15：SAO/PPO critic-only 预热
-
-新增独立的 [critic 预热代码包](swe_smith/critic_warmup/README.md) 和
-[实验记录](docs/critic-warmup-20261015.md)：固定 actor、冻结 critic attention，
-完成采样 token/logprob 对齐、结构化奖励闸门、原生 critic-only 恢复和单份
-checkpoint 原子保存。框架补丁在 `patches/critic-warmup-20261015.diff`，
-任务脚本和测试在 `swe_smith/critic_warmup/overlay/`。
-
-这是工程验收，不是已完成的 SAO 质量验收：最后执行到 step59、完整保存到
-step40 后因磁盘保护停训，解释方差仍负；actor 始终禁用，没有声称 VAL474 提升。
-该包直接应用到指定干净上游基线，不与旧 GRPO 补丁叠加。
-
-- RL 对照仍是 ep3 的 134/474。HMPO 第 46 步 135/474，p=1，没有续训（§83）。
-- 2026-10-10 起，蒸馏对照改为官方 MiniCPM5-2B-SFT 的 92/474。硬标签 **126/474**（p=0.0002），软标签 **121/474**（p=0.0003），OPD 最高 116/474。这是自蒸馏，不是 RL。当天数字在 [`docs/pitfalls-and-lessons.md`](docs/pitfalls-and-lessons.md) §84。
-- 跑完的训练和评测至少每天补一节。第 8 轮 OPD 是 113/474，低于 114，第 9 轮未训。从原版 MiniCPM5-2B 起的同一套硬标签是 132/474，相对基座记录的 123 多 9 题（§85）。
-- 100 轮基线：官方 SFT **100/474**；硬标签 **117/474**（p=0.0568）；软标签 **119/474**（p=0.0271）；原版 MiniCPM **126/474**（相对 100 的 p=0.0005，是基座不是蒸馏）。基座上的硬标签还在评（§90）。
+维护与实验记录约定见 [CONTRIBUTING.md](CONTRIBUTING.md)。
