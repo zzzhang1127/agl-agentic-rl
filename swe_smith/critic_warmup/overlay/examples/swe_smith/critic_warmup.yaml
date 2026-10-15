@@ -1,0 +1,93 @@
+# Bounded critic-only PPO smoke configuration, not a full SAO reproduction.
+# Merge after train_opencode_agent.build_config; model paths must be explicit.
+algorithm:
+  adv_estimator: gae
+  enable_rollout_level_advantage: false
+  gamma: 1.0
+  lam: 1.0
+  use_kl_in_reward: false
+
+agentlightning:
+  critic_only: true
+  freeze_critic_attention: true
+  require_explicit_reward: true
+  max_ppo_update_times: 1
+  async_rollout:
+    enabled: false
+  trace_aggregator:
+    level: trajectory
+    trajectory_max_prompt_length: 45056
+    trajectory_max_response_length: 6144
+
+# Four trajectories over two GPUs; one rollout per task, one critic epoch.
+data:
+  train_batch_size: 4
+  max_prompt_length: 45056
+  max_response_length: 6144
+  truncation: error
+
+actor_rollout_ref:
+  rollout:
+    n: 1
+    # TP=2 → two vLLM replicas (2 GPUs each) over the 4-GPU FSDP mesh,
+    # matching the already-validated 4-GPU GRPO layout.
+    tensor_model_parallel_size: 2
+    n_gpus_per_node: 4
+    max_model_len: 51200
+    gpu_memory_utilization: 0.6
+    max_num_seqs: 2
+    log_prob_max_token_len_per_gpu: 51200
+  actor:
+    ppo_mini_batch_size: 4
+    ppo_max_token_len_per_gpu: 51200
+    optim:
+      lr: 0.0
+    fsdp_config:
+      fsdp_size: 4
+  ref:
+    log_prob_max_token_len_per_gpu: 51200
+    fsdp_config:
+      fsdp_size: 4
+
+critic:
+  enable: true
+  strategy: fsdp
+  ppo_mini_batch_size: 4
+  ppo_micro_batch_size_per_gpu: 1
+  forward_micro_batch_size_per_gpu: 1
+  ppo_max_token_len_per_gpu: 51200
+  forward_max_token_len_per_gpu: 51200
+  use_dynamic_bsz: true
+  ppo_epochs: 1
+  loss_agg_mode: token-mean
+  optim:
+    lr: 1.0e-5
+    weight_decay: 0.01
+  model:
+    enable_gradient_checkpointing: true
+    use_remove_padding: true
+    lora_rank: 0
+    fsdp_config:
+      use_orig_params: true
+      fsdp_size: 4
+      param_offload: true
+      optimizer_offload: true
+
+trainer:
+  n_gpus_per_node: 4
+  use_legacy_worker_impl: enable
+  critic_warmup: 0
+  # This is an integration smoke budget, not a critic quality threshold.
+  total_training_steps: 2
+  total_epochs: 1
+  val_before_train: false
+  test_freq: 0
+  # ~30 min of steps at ~15 min/step; tune after measuring real step time.
+  # Atomic replace-save is handled by AgentLightningRayPPOTrainer._save_checkpoint.
+  save_freq: 2
+  logger: [console]
+  resume_mode: disable
+  resume_from_path: null
+  max_actor_ckpt_to_keep: null
+  max_critic_ckpt_to_keep: null
+  del_local_ckpt_after_load: false

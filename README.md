@@ -68,6 +68,18 @@ trainer 与 vLLM 推理共置在同一组 GPU 上，每步先 rollout 再更新�
 
 ## 之后会更新什么
 
+### 2026-10-15：SAO/PPO critic-only 预热
+
+新增独立的 [critic 预热代码包](swe_smith/critic_warmup/README.md) 和
+[实验记录](docs/critic-warmup-20261015.md)：固定 actor、冻结 critic attention，
+完成采样 token/logprob 对齐、结构化奖励闸门、原生 critic-only 恢复和单份
+checkpoint 原子保存。框架补丁在 `patches/critic-warmup-20261015.diff`，
+任务脚本和测试在 `swe_smith/critic_warmup/overlay/`。
+
+这是工程验收，不是已完成的 SAO 质量验收：最后执行到 step59、完整保存到
+step40 后因磁盘保护停训，解释方差仍负；actor 始终禁用，没有声称 VAL474 提升。
+该包直接应用到指定干净上游基线，不与旧 GRPO 补丁叠加。
+
 - RL 对照仍是 ep3 的 134/474。HMPO 第 46 步 135/474，p=1，没有续训（§83）。
 - 2026-10-10 起，蒸馏对照改为官方 MiniCPM5-2B-SFT 的 92/474。硬标签 **126/474**（p=0.0002），软标签 **121/474**（p=0.0003），OPD 最高 116/474。这是自蒸馏，不是 RL。当天数字在 [`docs/pitfalls-and-lessons.md`](docs/pitfalls-and-lessons.md) §84。
 - 跑完的训练和评测至少每天补一节。第 8 轮 OPD 是 113/474，低于 114，第 9 轮未训。从原版 MiniCPM5-2B 起的同一套硬标签是 132/474，相对基座记录的 123 多 9 题（§85）。

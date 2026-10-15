@@ -2,6 +2,13 @@
 
 本目录是本项目对上游框架的全部改动，以 diff 形式给出，可以直接套在上游对应版本上。
 
+2026-10-15 新增独立 critic-only 训练线：`critic-warmup-20261015.diff`。
+它针对干净上游 `218f1f7c`，包含冻结 attention、actor interlock、token/logprob
+对齐、奖励闸门、原生 critic 恢复、tracking 脱敏和原子保存。
+**不要与下面历史 GRPO 的 `agentlightning-core.diff` 叠加应用。**
+任务脚本、测试、文件校验和应用工具见
+[`swe_smith/critic_warmup`](../swe_smith/critic_warmup/README.md)。
+
 | 文件 | 针对 | 内容 |
 |---|---|---|
 | `agentlightning-core.diff` | microsoft/agent-lightning，基线提交 `218f1f7c`（2026-09 主干） | 5 个文件、+1016/−49 行，见下表 |

@@ -1,0 +1,1743 @@
+diff --git a/agentlightning/server/proxy.py b/agentlightning/server/proxy.py
+index fb63884..9628cd0 100644
+--- a/agentlightning/server/proxy.py
++++ b/agentlightning/server/proxy.py
+@@ -69,6 +69,8 @@ class ProxyRouter:
+             }
+             if self._include_log_probs:
+                 prepared["logprobs"] = True
++                prepared["top_logprobs"] = 0
++                prepared["return_tokens_as_token_ids"] = True
+             return prepared
+         if mode == "val":
+             prepared = {
+@@ -126,6 +128,8 @@ async def forward_request(
+         response_body = (
+             response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+         )
++        if isinstance(response_body, dict):
++            _fill_missing_token_ids(request_body=body, response_body=response_body, model_name=server.model)
+ 
+         _capture_event(
+             rollout_id=rollout_id,
+@@ -200,6 +204,221 @@ def _retry_delay_seconds(attempt_index: int) -> float:
+     return delay * random.uniform(0.75, 1.25)
+ 
+ 
++_TOKENIZERS: dict[str, Any] = {}
++
++
++def _assistant_text(choice: dict[str, Any]) -> str:
++    message = choice.get("message")
++    if not isinstance(message, dict):
++        return ""
++    content = message.get("content")
++    if isinstance(content, str) and content:
++        return content
++    reasoning = message.get("reasoning_content") or message.get("reasoning")
++    if isinstance(reasoning, str) and reasoning:
++        return reasoning
++    tool_calls = message.get("tool_calls")
++    if tool_calls:
++        return json.dumps(tool_calls, ensure_ascii=False)
++    return content if isinstance(content, str) else ""
++
++
++def _parse_sampled_token_id(token: str) -> int:
++    if not token.startswith("token_id:"):
++        raise ValueError("training completion is missing explicit sampled token IDs")
++    suffix = token[len("token_id:") :]
++    if not suffix.isascii() or not suffix.isdecimal():
++        raise ValueError("invalid sampled token ID")
++    return int(suffix)
++
++
++def _sampled_token_ids(choice: dict[str, Any]) -> list[int]:
++    """Read vLLM's sampled IDs, never re-encode parsed assistant/tool text."""
++    entries = (choice.get("logprobs") or {}).get("content")
++    if not isinstance(entries, list) or not entries:
++        raise ValueError("training completion is missing sampled-token logprobs")
++    ids = []
++    for entry in entries:
++        token = entry.get("token") if isinstance(entry, dict) else None
++        if not isinstance(token, str):
++            raise ValueError("training completion is missing explicit sampled token IDs")
++        ids.append(_parse_sampled_token_id(token))
++    existing = choice.get("token_ids")
++    if existing is not None and existing != ids:
++        raise ValueError("sampled token IDs disagree with completion token IDs")
++    return ids
++
++
++def _token_ids_from_vocab_logprobs(choice: dict[str, Any], model_name: str) -> list[int]:
++    """Map vLLM logprob.content token strings to ids (vLLM 0.8.x without token_id: labels)."""
++    entries = (choice.get("logprobs") or {}).get("content")
++    if not isinstance(entries, list) or not entries:
++        raise ValueError("training completion is missing sampled-token logprobs")
++    tokenizer = _TOKENIZERS.get(model_name)
++    if tokenizer is None:
++        from transformers import AutoTokenizer
++
++        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
++        _TOKENIZERS[model_name] = tokenizer
++    unk_id = getattr(tokenizer, "unk_token_id", None)
++    ids: list[int] = []
++    for entry in entries:
++        if not isinstance(entry, dict):
++            raise ValueError("malformed logprob entry")
++        token = entry.get("token")
++        if not isinstance(token, str) or not token:
++            raise ValueError("malformed logprob token")
++        token_id = tokenizer.convert_tokens_to_ids(token)
++        if token_id is None or not isinstance(token_id, int):
++            raise ValueError(f"tokenizer could not map logprob token {token!r}")
++        if unk_id is not None and token_id == unk_id:
++            raise ValueError(f"tokenizer mapped logprob token {token!r} to unk")
++        ids.append(int(token_id))
++    return ids
++
++
++def _behavior_logprob_token_ids(choice: dict[str, Any], model_name: str) -> list[int]:
++    """Token ids in the same order and length as logprobs.content (behavior policy)."""
++    entries = (choice.get("logprobs") or {}).get("content")
++    if not isinstance(entries, list) or not entries:
++        raise ValueError("training completion is missing sampled-token logprobs")
++    tokens = [entry.get("token") if isinstance(entry, dict) else None for entry in entries]
++    if all(isinstance(token, str) and token.startswith("token_id:") for token in tokens):
++        return _sampled_token_ids(choice)
++    if any(isinstance(token, str) and token.startswith("token_id:") for token in tokens):
++        raise ValueError("mixed token_id and vocab logprob tokens in one completion")
++    ids = _token_ids_from_vocab_logprobs(choice, model_name)
++    existing = choice.get("token_ids")
++    if existing is not None and existing != ids:
++        log.warning(
++            "replacing mismatched completion token_ids with behavior logprob ids",
++            model=model_name,
++            old_len=len(existing),
++            new_len=len(ids),
++        )
++    return ids
++
++
++def _training_expects_behavior_logprobs(request_body: dict[str, Any]) -> bool:
++    return request_body.get("return_tokens_as_token_ids") is True or request_body.get("logprobs") is True
++
++
++def _fill_missing_token_ids(*, request_body: dict[str, Any], response_body: dict[str, Any], model_name: str) -> None:
++    """Align response token ids with behavior logprobs; never re-encode parsed tool JSON for training."""
++    choices = response_body.get("choices")
++    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
++        return
++
++    training = _training_expects_behavior_logprobs(request_body)
++    for choice in choices:
++        entries = (choice.get("logprobs") or {}).get("content")
++        if isinstance(entries, list) and entries:
++            choice["token_ids"] = _behavior_logprob_token_ids(choice, model_name)
++            continue
++        if training:
++            raise ValueError("training completion is missing sampled-token logprobs")
++
++    prompt_ids = response_body.get("prompt_token_ids") or choices[0].get("prompt_token_ids") or []
++    response_ids = choices[0].get("token_ids") or []
++    if prompt_ids and response_ids:
++        return
++    try:
++        filled_prompt, filled_response = _tokenize_chat(model_name, request_body, choices[0])
++    except Exception as exc:
++        log.warning("token-id backfill failed", model=model_name, error=str(exc))
++        return
++    if not prompt_ids:
++        response_body["prompt_token_ids"] = filled_prompt
++    if not response_ids:
++        choices[0]["token_ids"] = filled_response
++    log.info(
++        "token-id backfill",
++        model=model_name,
++        prompt_tokens=len(response_body.get("prompt_token_ids") or []),
++        response_tokens=len(choices[0].get("token_ids") or []),
++    )
++
++
++def _to_int_ids(raw: Any) -> list[int]:
++    if hasattr(raw, "tolist"):
++        raw = raw.tolist()
++    if not isinstance(raw, list):
++        raise TypeError(f"tokenizer returned {type(raw).__name__}, expected list[int]")
++    return [int(x) for x in raw]
++
++
++def _normalize_messages_for_template(messages: Any) -> list[Any]:
++    """Normalize OpenAI tool-call arguments for chat-template tokenization.
++
++    vLLM/OpenCode requests carry function.arguments as a JSON string, while the
++    MiniCPM chat template iterates over arguments.items().  Convert only valid
++    JSON-object argument strings; leave everything else unchanged so malformed
++    requests still fail instead of being silently rewritten.
++    """
++    if not isinstance(messages, list):
++        return []
++    normalized: list[Any] = []
++    for message in messages:
++        if not isinstance(message, dict):
++            normalized.append(message)
++            continue
++        msg = dict(message)
++        tool_calls = msg.get("tool_calls")
++        if isinstance(tool_calls, list):
++            fixed_calls: list[Any] = []
++            for call in tool_calls:
++                if not isinstance(call, dict):
++                    fixed_calls.append(call)
++                    continue
++                fixed = dict(call)
++                function = fixed.get("function")
++                if isinstance(function, dict):
++                    fixed_function = dict(function)
++                    arguments = fixed_function.get("arguments")
++                    if isinstance(arguments, str):
++                        try:
++                            parsed_arguments = json.loads(arguments)
++                        except json.JSONDecodeError:
++                            parsed_arguments = None
++                        if isinstance(parsed_arguments, dict):
++                            fixed_function["arguments"] = parsed_arguments
++                    fixed["function"] = fixed_function
++                fixed_calls.append(fixed)
++            msg["tool_calls"] = fixed_calls
++        normalized.append(msg)
++    return normalized
++
++
++def _tokenize_chat(model_name: str, request_body: dict[str, Any], choice: dict[str, Any]) -> tuple[list[int], list[int]]:
++    tokenizer = _TOKENIZERS.get(model_name)
++    if tokenizer is None:
++        from transformers import AutoTokenizer
++
++        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
++        _TOKENIZERS[model_name] = tokenizer
++    messages = _normalize_messages_for_template(request_body.get("messages") or [])
++    tools = request_body.get("tools")
++    kwargs: dict[str, Any] = {"tokenize": True, "add_generation_prompt": True}
++    if tools:
++        kwargs["tools"] = tools
++    try:
++        prompt_ids = tokenizer.apply_chat_template(messages, **kwargs)
++    except Exception as exc:
++        # Some chat templates expect OpenAI tool schemas, while OpenCode/vLLM may
++        # pass provider-specific tool metadata.  For training we need a stable
++        # prompt-token prefix; retry without tools instead of leaving empty ids.
++        if "tools" not in kwargs:
++            raise
++        log.warning("chat-template tokenization with tools failed; retrying without tools", model=model_name, error=str(exc))
++        kwargs.pop("tools", None)
++        prompt_ids = tokenizer.apply_chat_template(messages, **kwargs)
++    if isinstance(prompt_ids, str):
++        prompt_ids = tokenizer.encode(prompt_ids, add_special_tokens=False)
++    prompt_ids = _to_int_ids(prompt_ids)
++    response_ids = tokenizer.encode(_assistant_text(choice), add_special_tokens=False)
++    return prompt_ids, _to_int_ids(response_ids)
++
++
+ async def _dec_inflight(pause_state: ProxyPauseState) -> None:
+     async with pause_state.lock:
+         pause_state.inflight = max(0, pause_state.inflight - 1)
+diff --git a/agentlightning/server/routes/events.py b/agentlightning/server/routes/events.py
+index 291023e..60da51a 100644
+--- a/agentlightning/server/routes/events.py
++++ b/agentlightning/server/routes/events.py
+@@ -145,9 +145,13 @@ def _trim_model_request(data: dict[str, Any]) -> dict[str, Any]:
+ 
+ 
+ def _trim_reward(data: dict[str, Any]) -> dict[str, Any]:
+-    """Keep only the scalar value from a reward event."""
++    """Keep the reward and explicit training-approval evidence."""
+     trimmed = {"value": data.get("value")}
+-    for key in ("source", "reason"):
++    for key in (
++        "source", "reason", "reward_eligible", "evaluation_state",
++        "trajectory_terminal", "termination_reason", "grader_protocol",
++        "p2p_scope", "report_sha256",
++    ):
+         if key in data:
+             trimmed[key] = data[key]
+     return trimmed
+@@ -157,7 +161,7 @@ def _to_triplet_format(event: Event) -> Event:
+     """Trim event data for triplet consumption.
+ 
+     - model_request: extract prompt_token_ids + response_token_ids only
+-    - reward: keep only the scalar value
++    - reward: keep the scalar value and explicit training-approval evidence
+     - other event types: pass through unchanged
+     """
+     if event.event_type == "model_request":
+diff --git a/agentlightning/verl/agl_rollout_manager.py b/agentlightning/verl/agl_rollout_manager.py
+index 7094592..beeda2b 100644
+--- a/agentlightning/verl/agl_rollout_manager.py
++++ b/agentlightning/verl/agl_rollout_manager.py
+@@ -5,6 +5,7 @@
+ from __future__ import annotations
+ 
+ import json  # [multimodal-patch]
++import os
+ import time
+ import traceback
+ import uuid
+@@ -12,6 +13,7 @@ from collections import defaultdict
+ from collections.abc import Mapping
+ from dataclasses import dataclass
+ from pathlib import Path
++from statistics import median
+ from typing import TYPE_CHECKING, Any, cast
+ 
+ import numpy as np
+@@ -84,6 +86,77 @@ class CompletedRollout(BaseModel):
+     error_message: str | None = None
+ 
+ 
++def _hmpo_enabled() -> bool:
++    return os.environ.get("SMITH_HMPO", "0").lower() in {"1", "true", "yes"}
++
++
++def _rollout_n_turns(rollout: CompletedRollout) -> int:
++    """Read smith_agent's posted n_turns; missing/invalid counts as 1."""
++    for event in reversed(rollout.triplet_events or []):
++        if not isinstance(event, dict):
++            continue
++        data = event.get("data")
++        if not isinstance(data, dict) or "n_turns" not in data:
++            continue
++        try:
++            return max(int(data["n_turns"]), 1)
++        except (TypeError, ValueError):
++            return 1
++    return 1
++
++
++def _hmpo_rewards(resolved: list[bool], lengths: list[int], *, floor: float = 0.1) -> list[float]:
++    """Group-median HMPO: wrong=0; budget = median length of correct members.
++
++    Keep this identical to examples/swe_smith/hmpo_reward.py:hmpo_rewards.
++    Inlined so the trainer process does not import the examples tree.
++    """
++    if len(resolved) != len(lengths):
++        raise ValueError(f"resolved ({len(resolved)}) and lengths ({len(lengths)}) size mismatch")
++    if not resolved:
++        return []
++    correct_lengths = [max(int(length), 1) for flag, length in zip(resolved, lengths, strict=True) if flag]
++    if not correct_lengths:
++        return [0.0] * len(resolved)
++    budget = float(median(correct_lengths))
++    out: list[float] = []
++    for flag, length in zip(resolved, lengths, strict=True):
++        if not flag:
++            out.append(0.0)
++            continue
++        scale = budget / max(int(length), 1)
++        out.append(min(1.0, max(floor, scale)))
++    return out
++
++
++def apply_hmpo_to_completed(rollouts: list[CompletedRollout]) -> list[CompletedRollout]:
++    """Reshape rewards inside each data_id group when SMITH_HMPO=1.
++
++    Agent must post raw 0/1 (SMITH_HMPO=1 skips the global t0 ramp). This is the
++    trainer-side half: algorithm.hmpo in train_smith_agent.py is not read by VERL.
++    """
++    if not rollouts or not _hmpo_enabled():
++        return rollouts
++    groups: dict[str, list[int]] = {}
++    for index, rollout in enumerate(rollouts):
++        groups.setdefault(rollout.data_id, []).append(index)
++    new_rewards = [rollout.final_reward for rollout in rollouts]
++    for indices in groups.values():
++        resolved = [(rollouts[i].final_reward or 0.0) > 0.0 for i in indices]
++        lengths = [_rollout_n_turns(rollouts[i]) for i in indices]
++        reshaped = _hmpo_rewards(resolved, lengths)
++        for i, value in zip(indices, reshaped, strict=True):
++            new_rewards[i] = value
++    out: list[CompletedRollout] = []
++    for rollout, reward in zip(rollouts, new_rewards, strict=True):
++        updated = rollout.model_copy(update={"final_reward": reward})
++        if updated.triplets:
++            last = updated.triplets[-1].model_copy(update={"reward": reward})
++            updated.triplets = [*updated.triplets[:-1], last]
++        out.append(updated)
++    return out
++
++
+ @dataclass
+ class _TraceEvent:
+     rollout_id: str
+@@ -494,7 +567,7 @@ class AglRolloutManagerBase:
+         finished_at = enqueued_rollout.finished_at
+         if finished_at is None:
+             finished_at = rollout.status.updated_at
+-        return CompletedRollout(
++        completed = CompletedRollout(
+             rollout_id=enqueued_rollout.rollout_id,
+             data_id=enqueued_rollout.data_id,
+             step=enqueued_rollout.step,
+@@ -511,6 +584,19 @@ class AglRolloutManagerBase:
+             rollout_state=rollout.status.state,
+             error_message=rollout.status.error_message,
+         )
++        archive_dir = os.environ.get("AGL_COMPLETED_ROLLOUT_ARCHIVE")
++        if archive_dir:
++            # Archive before server cleanup; failures must not silently lose traces.
++            directory = Path(archive_dir)
++            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
++            path = directory / f"{uuid.uuid4().hex}.json"
++            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
++            with os.fdopen(fd, "w", encoding="utf-8") as stream:
++                stream.write(completed.model_dump_json())
++                stream.write("\n")
++                stream.flush()
++                os.fsync(stream.fileno())
++        return completed
+ 
+ 
+ class AglRolloutManager(AglRolloutManagerBase):
+@@ -564,7 +650,7 @@ class AglRolloutManager(AglRolloutManagerBase):
+         for completed_rollout in completed_rollouts[num_deleted:]:
+             self._delete_rollout(completed_rollout.rollout_id)
+ 
+-        return completed_rollouts
++        return apply_hmpo_to_completed(completed_rollouts)
+ 
+ 
+ class AglAsyncRolloutManager(AglRolloutManagerBase):
+@@ -625,13 +711,14 @@ class AglAsyncRolloutManager(AglRolloutManagerBase):
+ 
+                 if all(enqueued_rollout.rollout_id in finished_rollout_ids for enqueued_rollout in group):
+                     completed_group_keys.add(data_id)
+-                    completed_rollouts.extend(
++                    group_completed = [
+                         self._build_completed_rollout(
+                             enqueued_rollout,
+                             terminal_rollouts[enqueued_rollout.rollout_id],
+                         )
+                         for enqueued_rollout in group
+-                    )
++                    ]
++                    completed_rollouts.extend(apply_hmpo_to_completed(group_completed))
+                     # Free completed group state after reading it.
+                     for enqueued_rollout in group:
+                         self._delete_rollout(enqueued_rollout.rollout_id)
+@@ -663,4 +750,5 @@ __all__ = [
+     "CompletedRollout",
+     "EnqueuedRollout",
+     "Triplet",
++    "apply_hmpo_to_completed",
+ ]
+diff --git a/agentlightning/verl/config.yaml b/agentlightning/verl/config.yaml
+index 7395d1d..dfaae45 100644
+--- a/agentlightning/verl/config.yaml
++++ b/agentlightning/verl/config.yaml
+@@ -20,6 +20,12 @@ agentlightning:
+   k8s:
+     job_template_path: null
+   reward_fillna_value: 0.0
++  # Enable for critic/PPO: unavailable rewards must never become negative examples.
++  require_explicit_reward: false
++  # A separate validated run/config is needed to leave critic-only warmup.
++  critic_only: false
++  # Verified legacy FSDP1 path; also requires critic.model.fsdp_config.use_orig_params=true.
++  freeze_critic_attention: false
+   max_ppo_update_times: null
+   trace_aggregator:
+     level: trajectory # transition | trajectory
+diff --git a/agentlightning/verl/critic_checkpoint.py b/agentlightning/verl/critic_checkpoint.py
+new file mode 100644
+index 0000000..f2fb8c9
+--- /dev/null
++++ b/agentlightning/verl/critic_checkpoint.py
+@@ -0,0 +1,35 @@
++# Copyright (c) Microsoft. All rights reserved.
++
++"""Validate an explicitly selected, complete critic-only checkpoint."""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++import re
++
++
++def validate_critic_checkpoint(
++    path: str, *, world_size: int, model_path: str
++) -> tuple[int, str, str]:
++    """Reject partial saves and incompatible model shapes before loading workers."""
++    if not isinstance(path, str) or not Path(path).is_absolute():
++        raise ValueError("critic resume requires an explicit absolute checkpoint path")
++    if type(world_size) is not int or world_size < 1:
++        raise ValueError("invalid critic resume world size")
++    folder = Path(path)
++    match = re.fullmatch(r"global_step_([0-9]+)", folder.name)
++    if not match or not folder.is_dir():
++        raise ValueError("critic resume requires a published global_step_N directory")
++    critic = folder / "critic"
++    required = [critic / f"{kind}_world_size_{world_size}_rank_{rank}.pt"
++                for kind in ("model", "optim", "extra_state") for rank in range(world_size)]
++    required += [folder / "data.pt", critic / "huggingface" / "config.json"]
++    if any(not item.is_file() or item.stat().st_size == 0 for item in required):
++        raise ValueError("critic checkpoint is missing model, optimizer, extra, or dataloader state")
++    saved = json.loads((critic / "huggingface" / "config.json").read_text())
++    expected = json.loads((Path(model_path) / "config.json").read_text())
++    for key in ("model_type", "hidden_size", "num_hidden_layers", "vocab_size",
++                "num_attention_heads", "num_key_value_heads"):
++        if key not in expected or saved.get(key) != expected[key]:
++            raise ValueError(f"critic checkpoint model mismatch: {key}")
++    return int(match.group(1)), str(critic), str(folder / "data.pt")
+diff --git a/agentlightning/verl/critic_freeze.py b/agentlightning/verl/critic_freeze.py
+new file mode 100644
+index 0000000..86a89ab
+--- /dev/null
++++ b/agentlightning/verl/critic_freeze.py
+@@ -0,0 +1,65 @@
++# Copyright (c) Microsoft. All rights reserved.
++
++"""Auditable, pre-sharding attention freezing for a Llama-style value model.
++
++This implements the user's freeze requirement, not the unverified SAO training
++recipe. Call before optimizer construction and FSDP wrapping; mixed frozen and
++trainable parameters require use_orig_params=True with FSDP1.
++"""
++from __future__ import annotations
++
++from typing import Any
++
++
++def freeze_llama_critic_attention(model: Any) -> dict[str, Any]:
++    """Freeze only attention parameters after validating every configured layer.
++
++    Never use no_grad around attention forwards: gradients must still propagate
++    through attention to trainable earlier MLPs. Unknown architectures and shared
++    attention/MLP parameters fail closed instead of partially freezing a model.
++    """
++    config = model.config
++    if getattr(config, "model_type", None) != "llama":
++        raise ValueError("attention freeze currently supports only verified Llama-style critics")
++    layer_count = getattr(config, "num_hidden_layers", None)
++    if type(layer_count) is not int or layer_count <= 0:
++        raise ValueError("invalid critic layer count")
++    backbone = getattr(model, "model", None)
++    layers = getattr(backbone, "layers", None)
++    if layers is None or len(layers) != layer_count:
++        raise ValueError("critic layers do not match model configuration")
++    attention_ids = set()
++    for layer in layers:
++        attention = getattr(layer, "self_attn", None)
++        if attention is None:
++            raise ValueError("critic layer missing self_attn")
++        for projection in ("q_proj", "k_proj", "v_proj", "o_proj"):
++            if getattr(attention, projection, None) is None:
++                raise ValueError(f"attention missing {projection}")
++        parameters = list(attention.parameters())
++        if not parameters:
++            raise ValueError("attention has no parameters")
++        attention_ids.update(id(p) for p in parameters)
++    named = list(model.named_parameters(remove_duplicate=False))
++    for name, parameter in named:
++        if getattr(parameter, "_is_flat_param", False):
++            raise ValueError("freeze must run before FSDP parameter flattening")
++        if id(parameter) in attention_ids and ".self_attn." not in name:
++            raise ValueError("attention parameter shared with non-attention module")
++    if not any(p.requires_grad and id(p) not in attention_ids for _, p in named):
++        raise ValueError("no trainable non-attention critic parameters")
++    for _, parameter in named:
++        if id(parameter) in attention_ids:
++            parameter.requires_grad_(False)
++            parameter.grad = None
++    # Count unique parameters, while preserving all names for auditing aliases.
++    unique = {id(p): p for _, p in named}
++    return {
++        "model_type": "llama",
++        "attention_layers": layer_count,
++        "frozen_attention_names": [n for n, p in named if id(p) in attention_ids],
++        "trainable_names": [n for n, p in named if p.requires_grad],
++        "frozen_attention_numel": sum(p.numel() for key, p in unique.items() if key in attention_ids),
++        "trainable_numel": sum(p.numel() for p in unique.values() if p.requires_grad),
++        "fsdp1_use_orig_params_required": True,
++    }
+diff --git a/agentlightning/verl/critic_worker.py b/agentlightning/verl/critic_worker.py
+new file mode 100644
+index 0000000..b366cda
+--- /dev/null
++++ b/agentlightning/verl/critic_worker.py
+@@ -0,0 +1,56 @@
++# Copyright (c) Microsoft. All rights reserved.
++
++"""Attention-frozen critic for the verified verl legacy FSDP1 builder."""
++from __future__ import annotations
++
++import json
++from threading import RLock
++from unittest.mock import patch
++
++from verl.workers.fsdp_workers import CriticWorker
++
++from .critic_freeze import freeze_llama_critic_attention
++
++_BUILD_LOCK = RLock()
++
++
++class AttentionFrozenCriticWorker(CriticWorker):
++    """Reuse upstream initialization, sharding, optimizer and checkpoint code.
++
++    verl 0.7.1 has no pre-FSDP model callback. Intercept its value-model loader
++    only during this synchronous builder, restoring it even on failure. Actor
++    loading does not use this value-head loader. Do not move freezing after the
++    parent builder: by then FSDP and the optimizer already exist.
++    """
++
++    def _build_critic_model_optimizer(self, config):
++        from importlib.metadata import version
++
++        from verl.utils import model as model_utils
++
++        if version("verl") != "0.7.1":
++            raise ValueError("attention-frozen worker requires verified verl 0.7.1")
++        if config.strategy != "fsdp":
++            raise ValueError("attention-frozen worker currently requires FSDP1")
++        if config.model.fsdp_config.get("use_orig_params", False) is not True:
++            raise ValueError("attention-frozen worker requires use_orig_params=True")
++        if config.model.get("lora_rank", 0) or config.model.get("lora_adapter_path"):
++            raise ValueError("attention-frozen worker does not support LoRA")
++
++        with _BUILD_LOCK:
++            original_loader = model_utils.load_valuehead_model
++            audits = []
++
++            def load_frozen_value_model(*args, **kwargs):
++                model = original_loader(*args, **kwargs)
++                audits.append(freeze_llama_critic_attention(model))
++                return model
++
++            with patch.object(model_utils, "load_valuehead_model", load_frozen_value_model):
++                result = super()._build_critic_model_optimizer(config)
++            if len(audits) != 1:
++                raise RuntimeError("upstream critic builder did not invoke exactly one value-model loader")
++            self.attention_freeze_audit = audits[0]
++            if self.rank == 0:
++                print("CRITIC_ATTENTION_FREEZE " + json.dumps(self.attention_freeze_audit), flush=True)
++            return result
+diff --git a/agentlightning/verl/entrypoint.py b/agentlightning/verl/entrypoint.py
+index 5c5b403..a6d6aff 100644
+--- a/agentlightning/verl/entrypoint.py
++++ b/agentlightning/verl/entrypoint.py
+@@ -12,18 +12,62 @@ Customizations:
+ 
+ from __future__ import annotations
+ 
++import json
+ import logging
+ import os
+ import socket
+ from collections.abc import Sequence
++from pathlib import Path
++from threading import RLock
+ from typing import Any, cast
++from unittest.mock import patch
+ 
+ import ray
+ from omegaconf import OmegaConf
+ 
++from .critic_freeze import freeze_llama_critic_attention
+ from .dataset import LoadedDataset
+ 
+ log = logging.getLogger(__name__)
++_BUILD_LOCK = RLock()
++
++
++class AttentionFrozenCriticWorkerMixin:
++    """Freeze critic attention before FSDP wrapping and optimizer construction."""
++
++    def _build_critic_model_optimizer(self, config):
++        from importlib.metadata import version
++
++        from verl.utils import model as model_utils
++
++        if version("verl") != "0.7.1":
++            raise ValueError("attention-frozen worker requires verified verl 0.7.1")
++        if config.strategy != "fsdp":
++            raise ValueError("attention-frozen worker currently requires FSDP1")
++        if config.model.fsdp_config.get("use_orig_params", False) is not True:
++            raise ValueError("attention-frozen worker requires use_orig_params=True")
++        if config.model.get("lora_rank", 0) or config.model.get("lora_adapter_path"):
++            raise ValueError("attention-frozen worker does not support LoRA")
++
++        with _BUILD_LOCK:
++            original_loader = model_utils.load_valuehead_model
++            audits = []
++
++            def load_frozen_value_model(*args, **kwargs):
++                model = original_loader(*args, **kwargs)
++                audits.append(freeze_llama_critic_attention(model))
++                return model
++
++            with patch.object(model_utils, "load_valuehead_model", load_frozen_value_model):
++                result = super()._build_critic_model_optimizer(config)
++            if len(audits) != 1:
++                raise RuntimeError("upstream critic builder did not invoke exactly one value-model loader")
++            self.attention_freeze_audit = audits[0]
++            if self.rank == 0:
++                print("CRITIC_ATTENTION_FREEZE " + json.dumps(self.attention_freeze_audit), flush=True)
++            return result
++
++
+ 
+ __all__ = [
+     "run_ppo",
+@@ -53,6 +97,22 @@ def run_ppo(
+         runtime_env_config = ray_init_kwargs.pop("runtime_env", {})
+         runtime_env_kwargs = dict(runtime_env_config) if isinstance(runtime_env_config, dict) else {}
+         runtime_env = {**default_runtime_env, **runtime_env_kwargs}
++        # Runtime env is shallow-merged by Ray; keep VERL's default env vars while
++        # allowing smoke deployments to inject PYTHONPATH for snapshot code.
++        default_env_vars = dict(default_runtime_env.get("env_vars", {}))
++        override_env_vars = runtime_env_kwargs.get("env_vars", {})
++        if isinstance(override_env_vars, dict):
++            runtime_env["env_vars"] = {**default_env_vars, **override_env_vars}
++        env_vars = runtime_env.setdefault("env_vars", {})
++        existing_pythonpath = env_vars.get("PYTHONPATH")
++        local_pythonpath = os.environ.get("PYTHONPATH")
++        package_root = str(Path(__file__).resolve().parents[2])
++        pythonpath_parts = [package_root]
++        if local_pythonpath:
++            pythonpath_parts.append(local_pythonpath)
++        if existing_pythonpath:
++            pythonpath_parts.append(str(existing_pythonpath))
++        env_vars["PYTHONPATH"] = ":".join(part for part in pythonpath_parts if part)
+         # Register the custom policy loss in each Ray actor process.
+         runtime_env.setdefault(
+             "worker_process_setup_hook",
+@@ -98,13 +158,34 @@ class _AglTaskRunner:
+         from agentlightning.verl.trainer import AgentLightningRayPPOTrainer
+ 
+         print(f"AglTaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
+-        pprint(OmegaConf.to_container(config, resolve=True))
++        display_config = OmegaConf.to_container(config, resolve=True)
++        display_config["agentlightning"]["agl_key"] = "<redacted>"
++        pprint(display_config)
+         OmegaConf.resolve(config)
+ 
+         # Worker setup — delegated to verl's TaskRunner
+         d = self._delegate
+         actor_rollout_cls, ray_worker_group_cls = d.add_actor_rollout_worker(config)
+         d.add_critic_worker(config)
++        freeze_attention = config.agentlightning.get("freeze_critic_attention", False)
++        if type(freeze_attention) is not bool:
++            raise ValueError("freeze_critic_attention must be a boolean")
++        if freeze_attention:
++            if not need_critic(config):
++                raise ValueError("attention freezing requires an enabled critic")
++            if config.critic.strategy != "fsdp" or config.trainer.get("use_legacy_worker_impl", "auto") not in {
++                "auto", "enable"
++            }:
++                raise ValueError("attention freezing requires the verified legacy FSDP1 critic")
++            from verl.trainer.ppo.ray_trainer import Role
++            from verl.workers.fsdp_workers import CriticWorker
++
++            AttentionFrozenCriticWorker = type(
++                "AttentionFrozenCriticWorker",
++                (AttentionFrozenCriticWorkerMixin, CriticWorker),
++                {"__module__": "agentlightning.verl.entrypoint"},
++            )
++            d.role_worker_mapping[Role.Critic] = ray.remote(AttentionFrozenCriticWorker)
+         d.add_reward_model_resource_pool(config)
+         d.add_ref_policy_worker(config, actor_rollout_cls)
+ 
+diff --git a/agentlightning/verl/per_rollout_loss.py b/agentlightning/verl/per_rollout_loss.py
+index 5209b1a..387d4bc 100644
+--- a/agentlightning/verl/per_rollout_loss.py
++++ b/agentlightning/verl/per_rollout_loss.py
+@@ -90,4 +90,67 @@ def compute_policy_loss_per_rollout_mean(
+ 
+ 
+ def register_in_worker() -> None:
+-    """Import hook used by Ray actor processes."""
++    """Import hook used by Ray actor processes.
++
++    Records the RMS change of a local parameter sample around each optimizer
++    step. The training driver watches ``WEIGHT_DELTA`` and raises the learning
++    rate when the gradient is nonzero but the weights barely move.
++    """
++    from verl.workers.actor.dp_actor import DataParallelPPOActor
++
++    if getattr(DataParallelPPOActor, "_weight_delta_wrapped", False):
++        return
++
++    original = DataParallelPPOActor._optimizer_step
++
++    def _flat_head(tensor, n: int):
++        if hasattr(tensor, "to_local"):
++            tensor = tensor.to_local()
++        flat = tensor.detach().reshape(-1)
++        return flat[:n].float().cpu().clone()
++
++    def _snap(actor, n: int = 2048):
++        chunks = []
++        seen = 0
++        for param in actor.actor_module.parameters():
++            if param.numel() == 0:
++                continue
++            chunks.append(_flat_head(param.data, n - seen))
++            seen += chunks[-1].numel()
++            if seen >= n:
++                break
++        return chunks
++
++    def _rms(before, after) -> float:
++        if not before or len(before) != len(after):
++            return float("nan")
++        total = 0.0
++        count = 0
++        for left, right in zip(before, after):
++            if left.numel() != right.numel():
++                return float("nan")
++            total += float((left - right).pow(2).sum())
++            count += left.numel()
++        if count == 0:
++            return float("nan")
++        return (total / count) ** 0.5
++
++    def _optimizer_step(self):
++        try:
++            before = _snap(self)
++        except Exception:
++            before = []
++        grad_norm = original(self)
++        try:
++            delta = _rms(before, _snap(self))
++        except Exception:
++            delta = float("nan")
++        self._last_param_rms_delta = delta
++        print(
++            f"WEIGHT_DELTA param_rms={delta:.3e} grad_norm={float(grad_norm):.3e}",
++            flush=True,
++        )
++        return grad_norm
++
++    DataParallelPPOActor._optimizer_step = _optimizer_step
++    DataParallelPPOActor._weight_delta_wrapped = True
+diff --git a/agentlightning/verl/reward_guard.py b/agentlightning/verl/reward_guard.py
+new file mode 100644
+index 0000000..f4c1a1c
+--- /dev/null
++++ b/agentlightning/verl/reward_guard.py
+@@ -0,0 +1,99 @@
++# Copyright (c) Microsoft. All rights reserved.
++
++"""Fail-closed checks before constructing training tensors from rollout rewards."""
++
++from __future__ import annotations
++
++import math
++from typing import Any
++
++
++def require_explicit_training_rewards(rollouts: list[Any], *, require_evaluator_approval: bool = False) -> None:
++    """Reject an entire batch rather than silently filling unavailable rewards.
++
++    This checks transport completeness, not grader correctness. GAE requires
++    explicit evaluator approval; legacy consumers may retain scalar-only rewards.
++    Approval metadata still needs a separately verified evaluator.
++    """
++    for rollout in rollouts:
++        reward = rollout.final_reward
++        if isinstance(reward, bool) or not isinstance(reward, (int, float)) or not math.isfinite(reward):
++            raise ValueError(f"rollout {rollout.rollout_id!r}: missing or non-finite training reward")
++        if rollout.error_message:
++            raise ValueError(f"rollout {rollout.rollout_id!r}: runner error makes reward unavailable")
++        approved_reward_seen = False
++        for event in rollout.triplet_events or []:
++            if not isinstance(event, dict):
++                raise ValueError(f"rollout {rollout.rollout_id!r}: malformed event")
++            if event.get("event_type") != "reward":
++                continue
++            data = event.get("data")
++            if not isinstance(data, dict):
++                raise ValueError(f"rollout {rollout.rollout_id!r}: malformed reward event")
++            if "reward_eligible" in data and data["reward_eligible"] is not True:
++                raise ValueError(f"rollout {rollout.rollout_id!r}: evaluator rejected training reward")
++            if require_evaluator_approval:
++                if data.get("reward_eligible") is not True or data.get("evaluation_state") != "complete":
++                    raise ValueError(f"rollout {rollout.rollout_id!r}: missing complete evaluator approval")
++                value = data.get("value")
++                if (isinstance(value, bool) or not isinstance(value, (int, float))
++                        or not math.isfinite(value) or value != reward):
++                    raise ValueError(f"rollout {rollout.rollout_id!r}: approved reward disagrees with final reward")
++                approved_reward_seen = True
++        if require_evaluator_approval and not approved_reward_seen:
++            raise ValueError(f"rollout {rollout.rollout_id!r}: missing complete evaluator approval")
++
++
++def split_explicit_training_rewards(
++    rollouts: list[Any],
++    *,
++    require_evaluator_approval: bool = False,
++) -> tuple[list[Any], list[tuple[str, str]]]:
++    """Partition rollouts into reward-safe rows and explicit rejection reasons.
++
++    SAO critic warmup must not train on unavailable or rejected rewards. A single
++    bad rollout should be dropped from the step, not converted into a fake zero
++    reward and not allowed to abort otherwise clean rollouts in the same batch.
++    """
++    accepted: list[Any] = []
++    rejected: list[tuple[str, str]] = []
++    for rollout in rollouts:
++        try:
++            require_explicit_training_rewards([rollout], require_evaluator_approval=require_evaluator_approval)
++        except ValueError as exc:
++            rejected.append((str(getattr(rollout, "rollout_id", "<unknown>")), str(exc)))
++        else:
++            accepted.append(rollout)
++    return accepted, rejected
++
++
++def require_token_logprob_alignment(rollout: Any) -> None:
++    """Reject rollouts whose stored ids are not aligned with behavior logprobs."""
++    for triplet in rollout.triplets or []:
++        response = triplet.response if hasattr(triplet, "response") else None
++        if not isinstance(response, dict):
++            raise ValueError(f"rollout {rollout.rollout_id!r}: malformed triplet response")
++        token_ids = response.get("token_ids", [])
++        log_probs = response.get("log_probs")
++        if not isinstance(token_ids, list) or not token_ids:
++            raise ValueError(f"rollout {rollout.rollout_id!r}: missing response token_ids")
++        if log_probs is None:
++            raise ValueError(f"rollout {rollout.rollout_id!r}: missing response log_probs for GAE")
++        if len(log_probs) != len(token_ids):
++            raise ValueError(
++                f"rollout {rollout.rollout_id!r}: token/logprob length mismatch "
++                f"({len(token_ids)} ids vs {len(log_probs)} logprobs)"
++            )
++
++
++def split_token_logprob_aligned_rollouts(rollouts: list[Any]) -> tuple[list[Any], list[tuple[str, str]]]:
++    accepted: list[Any] = []
++    rejected: list[tuple[str, str]] = []
++    for rollout in rollouts:
++        try:
++            require_token_logprob_alignment(rollout)
++        except ValueError as exc:
++            rejected.append((str(getattr(rollout, "rollout_id", "<unknown>")), str(exc)))
++        else:
++            accepted.append(rollout)
++    return accepted, rejected
+diff --git a/agentlightning/verl/rollout_adapter.py b/agentlightning/verl/rollout_adapter.py
+index acb1322..a4c3ed2 100644
+--- a/agentlightning/verl/rollout_adapter.py
++++ b/agentlightning/verl/rollout_adapter.py
+@@ -7,7 +7,10 @@ from __future__ import annotations
+ import base64  # [multimodal-patch]
+ import io
+ import json
++import os
++import random
+ import zipfile
++from pathlib import Path
+ from typing import Any, cast
+ 
+ import numpy as np
+@@ -16,10 +19,15 @@ from tensordict import TensorDict
+ from verl import DataProto
+ 
+ from agentlightning.verl.agl_rollout_manager import CompletedRollout
++from agentlightning.verl.reward_guard import (
++    split_explicit_training_rewards,
++    split_token_logprob_aligned_rollouts,
++)
+ 
+ _TRACE_MERGE_MISMATCH_WANDB_LIMIT = 100
+ _TRACE_MERGE_MISMATCH_TEXT_LIMIT = 4000
+ _ROLLOUT_TRAJECTORY_WANDB_LIMIT = 24
++_SWANLAB_SAMPLE_TEXT_LIMIT = 12000
+ _TRACE_MERGE_MISMATCH_COLUMNS = [
+     "global_steps",
+     "rollout_id",
+@@ -128,6 +136,79 @@ def _upload_trace_merge_mismatches_to_wandb(rows: list[dict[str, Any]], global_s
+         print(f"Warning: failed to upload trace merge mismatches to wandb: {exc}")
+ 
+ 
++def _save_rollout_trajectories_locally(
++    records: list[dict[str, Any]],
++    global_steps: int,
++    *,
++    is_validation: bool = False,
++) -> Path | None:
++    """Write every compact trajectory row to disk. WandB/SwanLab tables are capped."""
++    root = os.environ.get("AGL_TRAJ_DIR") or os.environ.get("AGL_CKPT_DIR")
++    if not root:
++        return None
++    split = "validation" if is_validation else "train"
++    path = Path(root) / "trajectories" / f"step_{global_steps}_{split}.jsonl"
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with path.open("w", encoding="utf-8") as handle:
++        for record in records:
++            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
++    try:
++        import swanlab
++
++        swanlab.log(
++            {
++                f"{split}/trajectory_rows": len(records),
++                f"{split}/trajectory_path": str(path),
++            },
++            step=global_steps,
++        )
++    except Exception:
++        # swanlab is optional; the jsonl file is the durable trajectory log.
++        pass
++    return path
++
++
++def _clip_swanlab_text(text: str) -> str:
++    if len(text) <= _SWANLAB_SAMPLE_TEXT_LIMIT:
++        return text
++    omitted = len(text) - _SWANLAB_SAMPLE_TEXT_LIMIT
++    return text[:_SWANLAB_SAMPLE_TEXT_LIMIT] + f"\n...[truncated {omitted} chars]"
++
++
++def _log_random_rollout_sample_to_swanlab(
++    records: list[dict[str, Any]],
++    global_steps: int,
++    *,
++    is_validation: bool = False,
++) -> None:
++    """Log one randomly sampled rollout per step so SwanLab shows agent behavior."""
++    if not records:
++        return
++    sample = random.choice(records)
++    split = "validation" if is_validation else "train"
++    prefix = f"{split}/sample"
++    prompt = _clip_swanlab_text(str(sample.get("prompt", "")))
++    response = _clip_swanlab_text(str(sample.get("response", "")))
++    try:
++        import swanlab
++
++        payload: dict[str, Any] = {
++            f"{prefix}_rollout_id": str(sample.get("rollout_id", "")),
++            f"{prefix}_reward": float(sample.get("reward", 0.0)),
++            f"{prefix}_prompt_chars": len(str(sample.get("prompt", ""))),
++            f"{prefix}_response_chars": len(str(sample.get("response", ""))),
++        }
++        try:
++            payload[f"{prefix}_prompt"] = swanlab.Text(prompt)
++            payload[f"{prefix}_response"] = swanlab.Text(response)
++        except Exception:
++            payload[f"{prefix}_prompt"] = prompt
++            payload[f"{prefix}_response"] = response
++        swanlab.log(payload, step=global_steps)
++    except Exception as exc:
++        print(f"Warning: failed to log random {split} rollout sample to swanlab: {exc}")
++
++
+ def _upload_compact_rollout_trajectories_to_wandb(
+     records: list[dict[str, Any]],
+     global_steps: int,
+@@ -185,6 +266,42 @@ def get_right_padded_ids_and_attention_mask(
+     return ids + [pad_token_id] * pad_len, [1] * seq_len + [0] * pad_len
+ 
+ 
++def _real_tokens(ids: list[int], mask: list[int]) -> list[int]:
++    return [token for token, bit in zip(ids, mask) if bit]
++
++
++def _repad_to_batch_max(
++    ids_list: list[list[int]],
++    mask_list: list[list[int]],
++    pad_token: int,
++    side: str,
++) -> tuple[list[list[int]], list[list[int]], int]:
++    """Pad only to the longest real row.
++
++    The configured max length still truncates earlier. Padding every row out to
++    that ceiling makes the batch width 131072 for this model, and the actor
++    then refuses the update because its per-GPU token budget is smaller.
++    """
++    rows = [_real_tokens(ids, mask) for ids, mask in zip(ids_list, mask_list)]
++    width = max((len(row) for row in rows), default=1)
++    out_ids: list[list[int]] = []
++    out_mask: list[list[int]] = []
++    for row in rows:
++        pad = width - len(row)
++        if side == "left":
++            out_ids.append([pad_token] * pad + row)
++            out_mask.append([0] * pad + [1] * len(row))
++        else:
++            out_ids.append(row + [pad_token] * pad)
++            out_mask.append([1] * len(row) + [0] * pad)
++    return out_ids, out_mask, width
++
++
++def _trim_and_right_pad(values: list[int] | list[float], real_len: int, width: int, pad_value: int | float):
++    real = list(values[:real_len])
++    return real + [pad_value] * (width - len(real))
++
++
+ # ---------------------------------------------------------------------------
+ # [multimodal-patch] Multimodal (image) support for mrope VLM training.
+ # Mirrors verl 0.8.0's AgentLoopWorker._compute_multi_modal_inputs /
+@@ -352,6 +469,8 @@ class RolloutAdapter:
+         device: torch.device,
+         pad_token_id: int,
+         reward_fillna_value: float = 0.0,
++        require_explicit_reward: bool = False,
++        gae_trajectory: bool = False,
+         trace_aggregator_level: str = "transition",
+         tokenizer: Any | None = None,
+         processor: Any | None = None,  # [multimodal-patch] HF processor; None keeps text-only behavior
+@@ -361,10 +480,38 @@ class RolloutAdapter:
+         self.device = device
+         self.pad_token_id = pad_token_id
+         self.reward_fillna_value = reward_fillna_value
++        self.require_explicit_reward = require_explicit_reward
++        self.gae_trajectory = gae_trajectory
+         self.trace_aggregator_level = trace_aggregator_level
+         self.tokenizer = tokenizer
+         self.processor = processor  # [multimodal-patch]
+ 
++    def _reconstruct_missing_prompts(self, triplets: list[Triplet]) -> list[Triplet]:
++        """Fill missing prompt ids from the previous prompt+response prefix.
++
++        Some gateway/tool requests cannot be re-tokenized by the chat template
++        because provider-specific tool metadata is not accepted by the local
++        tokenizer. For GAE trajectory merging, a missing prompt on later turns is
++        still recoverable when the previous context is known: it means no new
++        observation tokens were captured between policy actions. This preserves
++        response/logprob alignment and lets the conservative prefix check run.
++        """
++        if not self.gae_trajectory or len(triplets) < 2:
++            return triplets
++        rebuilt: list[Triplet] = []
++        current_context: list[int] | None = None
++        changed = False
++        for triplet in triplets:
++            prompt_ids = triplet.prompt.get("token_ids", [])
++            response_ids = triplet.response.get("token_ids", [])
++            if (not prompt_ids) and current_context:
++                triplet = triplet.model_copy(update={"prompt": {"token_ids": list(current_context)}})
++                prompt_ids = triplet.prompt["token_ids"]
++                changed = True
++            rebuilt.append(triplet)
++            current_context = list(prompt_ids) + list(response_ids)
++        return rebuilt if changed else triplets
++
+     def get_train_data_batch(
+         self,
+         completed_rollouts: list[CompletedRollout],
+@@ -372,9 +519,32 @@ class RolloutAdapter:
+         global_steps: int = 0,
+     ) -> tuple[DataProto, dict[str, Any]]:
+         """Build a VERL training batch from completed rollouts."""
++        reward_guard_rejections: list[tuple[str, str]] = []
++        if self.require_explicit_reward or self.gae_trajectory:
++            completed_rollouts, reward_guard_rejections = split_explicit_training_rewards(
++                completed_rollouts,
++                require_evaluator_approval=self.gae_trajectory,
++            )
++            if reward_guard_rejections:
++                for rollout_id, reason in reward_guard_rejections[:8]:
++                    print(f"WARNING: dropping rollout with unsafe reward: {rollout_id}: {reason}", flush=True)
++            if not completed_rollouts:
++                reasons = "; ".join(reason for _, reason in reward_guard_rejections[:4])
++                raise ValueError(f"all rollouts were rejected by reward guard: {reasons}")
++        token_align_rejections: list[tuple[str, str]] = []
++        if self.gae_trajectory:
++            completed_rollouts, token_align_rejections = split_token_logprob_aligned_rollouts(completed_rollouts)
++            if token_align_rejections:
++                for rollout_id, reason in token_align_rejections[:8]:
++                    print(f"WARNING: dropping rollout with token/logprob mismatch: {rollout_id}: {reason}", flush=True)
++            if not completed_rollouts:
++                reasons = "; ".join(reason for _, reason in token_align_rejections[:4])
++                raise ValueError(f"all rollouts failed token/logprob alignment: {reasons}")
+         level = self.trace_aggregator_level
+         if level not in {"transition", "trajectory"}:
+             raise ValueError(f"Unknown trace_aggregator_level: {level}")
++        if self.gae_trajectory and level != "trajectory":
++            raise ValueError("GAE requires complete trajectory rows, not independent transitions")
+ 
+         # Keep rollout randomness within each sample instead of ordering samples by completion time.
+         sorted_rollouts = sorted(completed_rollouts, key=lambda rollout: (rollout.step, rollout.sample_idx_in_step))
+@@ -412,6 +582,7 @@ class RolloutAdapter:
+         image_urls_list: list[list[str] | None] = []  # [multimodal-patch] per kept training row
+         n_trunc_sample_because_of_response = 0
+         n_skipped_empty_training_rows = 0
++        n_skipped_prefix_mismatch_rollouts = 0
+         unmerged_count = 0
+         response_len_per_turn_list: list[int] = []
+         merge_mismatch_rows: list[dict[str, Any]] = []
+@@ -429,6 +600,10 @@ class RolloutAdapter:
+             image_urls: list[str] | None = None,  # [multimodal-patch]
+         ) -> None:
+             nonlocal n_skipped_empty_training_rows, n_trunc_sample_because_of_response
++            if self.gae_trajectory and (
++                len(prompt_ids) > self.max_prompt_length or len(response_ids) > self.max_response_length
++            ):
++                raise ValueError("GAE trajectory truncation requires explicit bootstrap semantics")
+             if len(prompt_ids) > self.max_prompt_length:
+                 prompt_ids = prompt_ids[: self.max_prompt_length]
+                 is_drop = True
+@@ -487,9 +662,10 @@ class RolloutAdapter:
+                 print(f"Warning: No triplets found for training rollout {rollout.rollout_id}, skipping.")
+                 continue
+             sample_with_trace_count += 1
++            triplets = self._reconstruct_missing_prompts(rollout.triplets)
+ 
+             if level == "transition":
+-                for turn_index, triplet in enumerate(rollout.triplets):
++                for turn_index, triplet in enumerate(triplets):
+                     response_ids = triplet.response["token_ids"]
+                     log_probs = triplet.response["log_probs"]
+                     response_len_per_turn_list.append(len(response_ids))
+@@ -505,7 +681,7 @@ class RolloutAdapter:
+                     )
+                 continue
+             else:
+-                first_triplet = rollout.triplets[0]
++                first_triplet = triplets[0]
+                 group_start_turn_index = 0
+                 current_prompt_ids = list(first_triplet.prompt["token_ids"])
+                 current_response_ids = list(first_triplet.response["token_ids"])
+@@ -515,7 +691,8 @@ class RolloutAdapter:
+                 response_len_per_turn_list.append(len(current_response_ids))
+                 merged_group_count = 0
+ 
+-                for turn_index, triplet in enumerate(rollout.triplets[1:], start=1):
++                skip_rollout_for_prefix_mismatch = False
++                for turn_index, triplet in enumerate(triplets[1:], start=1):
+                     prompt_ids = triplet.prompt["token_ids"]
+                     response_ids = triplet.response["token_ids"]
+                     log_probs = triplet.response["log_probs"]
+@@ -539,6 +716,43 @@ class RolloutAdapter:
+                         current_context = next_context
+                         continue
+ 
++                    if self.gae_trajectory:
++                        if len(merge_mismatch_rows) < _TRACE_MERGE_MISMATCH_WANDB_LIMIT:
++                            merge_mismatch_rows.append(
++                                {
++                                    "global_steps": global_steps,
++                                    "rollout_id": rollout.rollout_id,
++                                    "data_id": rollout.data_id,
++                                    "turn_index": turn_index,
++                                    "template_mismatch": False,
++                                    "retoken_mismatch": False,
++                                    "others_mismatch": True,
++                                    "prompt_length": len(prompt_ids),
++                                    "response_length": len(response_ids),
++                                    "previous_trace_length": len(current_context),
++                                    "current_trace_length": len(next_context),
++                                    "previous_trace": _decode_trace_text(self.tokenizer, current_context),
++                                    "current_trace": _decode_trace_text(self.tokenizer, next_context),
++                                }
++                            )
++                        if os.environ.get("AGL_GAE_KEEP_TERMINAL_SEGMENT_ON_PREFIX_MISMATCH", "0").lower() in {
++                            "1", "true", "yes"
++                        }:
++                            # OpenCode may compact its context into a fresh summarized prompt.
++                            # Without cross-row value linkage, only the final contiguous suffix can
++                            # safely receive the terminal outcome.  Drop the earlier segment and keep
++                            # scanning from the new prompt.
++                            unmerged_count += 1
++                            group_start_turn_index = turn_index
++                            current_context = next_context
++                            current_prompt_ids = list(prompt_ids)
++                            current_response_ids = list(response_ids)
++                            current_response_mask = [1] * len(response_ids)
++                            current_response_log_probs = log_probs
++                            merged_group_count = 0
++                            continue
++                        skip_rollout_for_prefix_mismatch = True
++                        break
+                     if len(merge_mismatch_rows) < _TRACE_MERGE_MISMATCH_WANDB_LIMIT:
+                         merge_mismatch_rows.append(
+                             {
+@@ -578,6 +792,11 @@ class RolloutAdapter:
+                     current_response_mask = [1] * len(response_ids)
+                     current_response_log_probs = log_probs
+ 
++                if skip_rollout_for_prefix_mismatch:
++                    n_skipped_prefix_mismatch_rollouts += 1
++                    unmerged_count += 1
++                    continue
++
+                 append_training_row(
+                     rollout_id=rollout.rollout_id,
+                     data_id=rollout.data_id,
+@@ -593,19 +812,83 @@ class RolloutAdapter:
+                 if merged_group_count > 1:
+                     unmerged_count += 1
+ 
+-        rollout_trajectory_records = _build_compact_rollout_trajectory_records(
++        all_rollout_trajectory_records = _build_compact_rollout_trajectory_records(
+             sorted_rollouts,
+             tokenizer=self.tokenizer,
+             reward_fillna_value=self.reward_fillna_value,
+-            limit=_ROLLOUT_TRAJECTORY_WANDB_LIMIT,
+         )
++        _save_rollout_trajectories_locally(all_rollout_trajectory_records, global_steps)
++        _log_random_rollout_sample_to_swanlab(all_rollout_trajectory_records, global_steps)
+         _upload_trace_merge_mismatches_to_wandb(merge_mismatch_rows, global_steps)
+-        _upload_compact_rollout_trajectories_to_wandb(rollout_trajectory_records, global_steps)
++        _upload_compact_rollout_trajectories_to_wandb(
++            all_rollout_trajectory_records[:_ROLLOUT_TRAJECTORY_WANDB_LIMIT],
++            global_steps,
++        )
+ 
+         n_sample = len(input_ids_list)
+         if n_sample == 0:
++            zero_row_debug = {
++                "global_steps": global_steps,
++                "n_rollouts_after_reward_guard": len(sorted_rollouts),
++                "n_rollouts_rejected_by_reward_guard": len(reward_guard_rejections),
++                "n_rollouts_skipped_prefix_mismatch": n_skipped_prefix_mismatch_rollouts,
++                "n_skipped_empty_training_rows": n_skipped_empty_training_rows,
++                "n_trace_merge_mismatch_rows": len(merge_mismatch_rows),
++                "rollouts": [
++                    {
++                        "rollout_id": rollout.rollout_id,
++                        "data_id": rollout.data_id,
++                        "final_reward": rollout.final_reward,
++                        "n_triplets": len(rollout.triplets),
++                        "triplet_lengths": [
++                            {
++                                "prompt": len(triplet.prompt.get("token_ids", [])),
++                                "response": len(triplet.response.get("token_ids", [])),
++                                "log_probs": None
++                                if triplet.response.get("log_probs") is None
++                                else len(triplet.response.get("log_probs", [])),
++                            }
++                            for triplet in rollout.triplets
++                        ],
++                    }
++                    for rollout in sorted_rollouts
++                ],
++                "merge_mismatch_rows": merge_mismatch_rows,
++                "reward_guard_rejections": reward_guard_rejections,
++            }
++            root = os.environ.get("AGL_TRAJ_DIR") or os.environ.get("AGL_CKPT_DIR")
++            if root:
++                debug_path = Path(root) / "zero_training_rows" / f"step_{global_steps}.json"
++                debug_path.parent.mkdir(parents=True, exist_ok=True)
++                debug_path.write_text(json.dumps(zero_row_debug, ensure_ascii=False, indent=2) + "\n")
++                print(f"ZERO_TRAINING_ROWS_DEBUG {debug_path}", flush=True)
++            else:
++                print("ZERO_TRAINING_ROWS_DEBUG " + json.dumps(zero_row_debug, ensure_ascii=False), flush=True)
+             raise RuntimeError("get_train_data_batch emitted zero training rows.")
+ 
++        old_response_masks = response_attention_mask_list
++        input_ids_list, input_attention_mask_list, prompt_width = _repad_to_batch_max(
++            input_ids_list, input_attention_mask_list, self.pad_token_id, "left"
++        )
++        response_ids_list, response_attention_mask_list, response_width = _repad_to_batch_max(
++            response_ids_list, old_response_masks, self.pad_token_id, "right"
++        )
++        if response_mask_list:
++            response_mask_list = [
++                _trim_and_right_pad(mask, sum(old), response_width, 0)
++                for mask, old in zip(response_mask_list, old_response_masks)
++            ]
++        response_log_probs_list = [
++            None
++            if probs is None
++            else _trim_and_right_pad(probs, sum(old), response_width, 0.0)
++            for probs, old in zip(response_log_probs_list, old_response_masks)
++        ]
++        print(
++            f"TRAIN_PAD rows={n_sample} prompt_width={prompt_width} response_width={response_width}",
++            flush=True,
++        )
++
+         batch_input_ids = torch.LongTensor(input_ids_list).to(self.device)
+         input_attention_mask = torch.LongTensor(input_attention_mask_list).to(self.device)
+         batch_response_ids = torch.LongTensor(response_ids_list).to(self.device)
+@@ -726,7 +1009,18 @@ class RolloutAdapter:
+         token_positions = torch.arange(attention_mask.shape[-1], device=attention_mask.device).unsqueeze(0)
+         eos_mask_idx = torch.argmax(token_positions * attention_mask, dim=-1)
+         token_level_scores[torch.arange(n_sample), eos_mask_idx] = scores
+-        token_level_scores = token_level_scores[:, -self.max_response_length :]
++        # Align token_level_scores to the batch-local response width instead of
++        # max_response_length, otherwise its width diverges from responses when the
++        # longest real response is shorter than the configured ceiling.
++        token_level_scores = token_level_scores[:, -response_width:]
++        if self.gae_trajectory:
++            assert batch_response_mask is not None
++            # Terminal outcome belongs to the last policy action, never an
++            # observation skipped by verl's GAE recursion.
++            action_positions = torch.arange(response_width, device=self.device).unsqueeze(0)
++            last_action = (action_positions * batch_response_mask).argmax(dim=-1)
++            token_level_scores = torch.zeros_like(batch_response_mask, dtype=scores.dtype)
++            token_level_scores[torch.arange(n_sample, device=self.device), last_action] = scores
+ 
+         batch_dict = {
+             "prompts": batch_input_ids,
+@@ -741,12 +1035,18 @@ class RolloutAdapter:
+             assert batch_response_mask is not None
+             batch_dict["response_mask"] = batch_response_mask
+         if emit_rollout_log_probs:
+-            padded_log_probs_list = [
+-                log_probs + [0.0] * (self.max_response_length - len(log_probs))
+-                for log_probs in response_log_probs_list
+-                if log_probs is not None
++            # Match the batch-local response width from _repad_to_batch_max, not max_response_length.
++            rollout_log_probs_rows = [
++                log_probs for log_probs in response_log_probs_list if log_probs is not None
+             ]
+-            batch_dict["rollout_log_probs"] = torch.tensor(padded_log_probs_list, dtype=torch.float32).to(self.device)
++            if rollout_log_probs_rows and len(rollout_log_probs_rows[0]) != response_width:
++                raise RuntimeError(
++                    "rollout_log_probs width "
++                    f"{len(rollout_log_probs_rows[0])} != batch response width {response_width}"
++                )
++            batch_dict["rollout_log_probs"] = torch.tensor(
++                rollout_log_probs_rows, dtype=torch.float32
++            ).to(self.device)
+ 
+         batch = TensorDict(batch_dict, batch_size=n_sample)  # type: ignore[arg-type]
+         data_proto = DataProto(batch=batch)
+@@ -764,6 +1064,8 @@ class RolloutAdapter:
+             "training/reward": float(np.mean(final_rewards)) if final_rewards else 0.0,
+             "training/n_sample": n_sample,
+             "training/n_rollouts": len(sorted_rollouts),
++            "training/n_rollouts_rejected_by_reward_guard": len(reward_guard_rejections),
++            "training/n_rollouts_skipped_prefix_mismatch": n_skipped_prefix_mismatch_rollouts,
+             "training/n_rollouts_w_trace": sample_with_trace_count,
+             "training/n_rollouts_w_reward": sample_with_reward_count,
+             "training/n_truncated_sample": n_trunc_sample_because_of_response,
+@@ -809,6 +1111,11 @@ class RolloutAdapter:
+             tokenizer=self.tokenizer,
+             reward_fillna_value=self.reward_fillna_value,
+         )
++        _save_rollout_trajectories_locally(
++            validation_trajectory_records,
++            global_steps,
++            is_validation=True,
++        )
+         _upload_compact_rollout_trajectories_to_wandb(
+             validation_trajectory_records,
+             global_steps,
+diff --git a/agentlightning/verl/tracking_config.py b/agentlightning/verl/tracking_config.py
+new file mode 100644
+index 0000000..a6ca349
+--- /dev/null
++++ b/agentlightning/verl/tracking_config.py
+@@ -0,0 +1,26 @@
++# Copyright (c) Microsoft. All rights reserved.
++
++"""Keep runtime credentials out of experiment tracking configuration."""
++
++from __future__ import annotations
++
++from typing import Any
++
++
++def redact_tracking_config(value: Any) -> Any:
++    """Return a separate logging tree; the live training config stays intact."""
++    secret_keys = {
++        "agl_key", "api_key", "service_key", "password", "authorization",
++        "access_token", "refresh_token", "secret", "client_secret", "swanlab_api_key",
++    }
++    if isinstance(value, dict):
++        return {
++            key: "<redacted>" if isinstance(key, str) and key.lower() in secret_keys
++            else redact_tracking_config(item)
++            for key, item in value.items()
++        }
++    if isinstance(value, list):
++        return [redact_tracking_config(item) for item in value]
++    if isinstance(value, tuple):
++        return tuple(redact_tracking_config(item) for item in value)
++    return value
+diff --git a/agentlightning/verl/trainer.py b/agentlightning/verl/trainer.py
+index 57575e7..6085a09 100644
+--- a/agentlightning/verl/trainer.py
++++ b/agentlightning/verl/trainer.py
+@@ -6,7 +6,9 @@ from __future__ import annotations
+ 
+ import asyncio
+ import logging
++import os
+ import random
++import shutil
+ import time
+ import uuid
+ from collections import defaultdict
+@@ -45,12 +47,50 @@ from .agl_rollout_manager import (
+ from .per_rollout_loss import PER_ROLLOUT_MEAN_LOSS_MODE, normalize_advantages_by_rollout
+ from .rollout_adapter import RolloutAdapter
+ from .rollout_level_advantage import compute_rollout_level_advantage
++from .training_phase import actor_update_allowed
++from .tracking_config import redact_tracking_config
++from .critic_checkpoint import validate_critic_checkpoint
+ 
+ log = logging.getLogger(__name__)
+ 
+ RolloutManagerT = TypeVar("RolloutManagerT", bound=AglRolloutManagerBase)
+ 
+ 
++def _atomic_replace_dir(tmp_dir: str, final_dir: str) -> None:
++    """Publish a finished checkpoint directory by renaming `*.tmp` over the live path."""
++    old_dir = final_dir + ".old"
++    if os.path.exists(old_dir):
++        shutil.rmtree(old_dir)
++    if os.path.exists(final_dir):
++        os.rename(final_dir, old_dir)
++    os.replace(tmp_dir, final_dir)
++    if os.path.exists(old_dir):
++        shutil.rmtree(old_dir)
++
++
++def _atomic_write_text(path: str, text: str) -> None:
++    tmp_path = path + ".tmp"
++    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
++    with os.fdopen(fd, "w", encoding="utf-8") as handle:
++        handle.write(text)
++        handle.flush()
++        os.fsync(handle.fileno())
++    os.replace(tmp_path, path)
++
++
++def _prune_old_step_dirs(ckpt_root: str, keep_step: int) -> None:
++    keep_name = f"global_step_{keep_step}"
++    if not os.path.isdir(ckpt_root):
++        return
++    for name in os.listdir(ckpt_root):
++        path = os.path.join(ckpt_root, name)
++        if name.endswith(".tmp") or name.endswith(".old"):
++            shutil.rmtree(path, ignore_errors=True)
++            continue
++        if name.startswith("global_step_") and name != keep_name:
++            shutil.rmtree(path, ignore_errors=True)
++
++
+ def _batch_dict_len(batch: dict[str, Any] | None) -> int:
+     """Leading-dim length of a dataloader batch dict (0 if absent/empty)."""
+     if batch is None or not batch:
+@@ -112,6 +152,100 @@ class AgentLightningRayPPOTrainer(RayPPOTrainer):
+         self._carry_over_rollouts: list[EnqueuedRollout] = []
+         self._train_dataloader_iter: Any | None = None
+ 
++    def _load_checkpoint(self):
++        if not self.config.agentlightning.get("critic_only", False):
++            return super()._load_checkpoint()
++        if self.config.trainer.resume_mode == "disable":
++            return 0
++        if self.config.trainer.resume_mode != "resume_path":
++            raise ValueError("critic-only resume requires an explicit resume_path")
++        if self.config.trainer.del_local_ckpt_after_load:
++            raise ValueError("critic-only resume must preserve its source checkpoint")
++        step, critic_path, data_path = validate_critic_checkpoint(
++            self.config.trainer.resume_from_path,
++            world_size=self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes,
++            model_path=self.config.critic.model.path,
++        )
++        actor_update_allowed(critic_only=True, use_critic=self.use_critic,
++                             global_steps=step, critic_warmup=self.config.trainer.critic_warmup)
++        data_state = torch.load(data_path, weights_only=False)
++        # The fixed rollout actor stays at the explicitly configured base model.
++        self.critic_wg.load_checkpoint(critic_path, del_local_after_load=False)
++        self.train_dataloader.load_state_dict(data_state)
++        self.global_steps = step
++        print(f"CRITIC_ONLY_RESUME step={step} checkpoint={critic_path} actor_loaded=0", flush=True)
++
++    def _save_checkpoint(self):
++        """Write `global_step_N.tmp`, then rename over the live directory.
++
++        A crash during the worker save leaves the previous `global_step_*` and
++        tracker untouched. `max_actor_ckpt_to_keep=1` is enough because the
++        old directory is only removed after the rename succeeds.
++        """
++        from verl.utils.fs import local_mkdir_safe
++
++        try:
++            from verl.trainer.ppo.utils import Role
++        except ImportError:
++            from verl.trainer.ppo.ray_trainer import Role
++
++        ckpt_root = self.config.trainer.default_local_dir
++        step_name = f"global_step_{self.global_steps}"
++        final_folder = os.path.join(ckpt_root, step_name)
++        tmp_folder = final_folder + ".tmp"
++        if os.path.exists(tmp_folder):
++            shutil.rmtree(tmp_folder)
++        local_mkdir_safe(tmp_folder)
++
++        print(f"local_global_step_folder (tmp): {tmp_folder}")
++        critic_only = self.config.agentlightning.get("critic_only", False)
++        if critic_only:
++            print("critic_only checkpoint: skipping actor checkpoint save", flush=True)
++        else:
++            actor_local_path = os.path.join(tmp_folder, "actor")
++            actor_remote_path = (
++                None
++                if self.config.trainer.default_hdfs_dir is None
++                else os.path.join(self.config.trainer.default_hdfs_dir, step_name, "actor")
++            )
++            self.actor_rollout_wg.save_checkpoint(
++                actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=None
++            )
++
++        if self.use_critic:
++            critic_local_path = os.path.join(tmp_folder, str(Role.Critic))
++            critic_remote_path = (
++                None
++                if self.config.trainer.default_hdfs_dir is None
++                else os.path.join(self.config.trainer.default_hdfs_dir, step_name, str(Role.Critic))
++            )
++            self.critic_wg.save_checkpoint(
++                critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=None
++            )
++
++        dataloader_local_path = os.path.join(tmp_folder, "data.pt")
++        dataloader_state_dict = self.train_dataloader.state_dict()
++        torch.save(dataloader_state_dict, dataloader_local_path)
++
++        # Do not publish a partial critic save or retire the last recoverable step.
++        if self.use_critic:
++            world_size = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
++            expected = [
++                os.path.join(tmp_folder, str(Role.Critic), f"{kind}_world_size_{world_size}_rank_{rank}.pt")
++                for kind in ("model", "optim", "extra_state")
++                for rank in range(world_size)
++            ]
++            expected.append(dataloader_local_path)
++            if not all(os.path.isfile(path) and os.path.getsize(path) > 0 for path in expected):
++                raise ValueError("Incomplete critic checkpoint; previous checkpoint retained")
++
++        _atomic_replace_dir(tmp_folder, final_folder)
++        _atomic_write_text(
++            os.path.join(ckpt_root, "latest_checkpointed_iteration.txt"),
++            str(self.global_steps),
++        )
++        _prune_old_step_dirs(ckpt_root, self.global_steps)
++
+     def _ensure_hooks(self) -> RolloutHooks | None:
+         if self._hooks is not None:
+             return self._hooks
+@@ -408,12 +542,17 @@ class AgentLightningRayPPOTrainer(RayPPOTrainer):
+             else self.config.data.max_response_length
+         )
+         pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
++        gae_trajectory = self.config.algorithm.adv_estimator == "gae"
++        if gae_trajectory and self.config.algorithm.get("enable_rollout_level_advantage", False):
++            raise ValueError("GAE is token-level; disable enable_rollout_level_advantage")
+         rollout_adapter = RolloutAdapter(
+             max_prompt_length=max_prompt_length,
+             max_response_length=max_response_length,
+             device=torch.device("cpu"),
+             pad_token_id=pad_token_id,
+             reward_fillna_value=self.config.agentlightning.reward_fillna_value,
++            require_explicit_reward=gae_trajectory or self.config.agentlightning.get("require_explicit_reward", False),
++            gae_trajectory=gae_trajectory,
+             trace_aggregator_level=level,
+             tokenizer=self.tokenizer,
+             # [multimodal-patch] RayPPOTrainer stores the processor from entrypoint; forwarding it
+@@ -422,10 +561,21 @@ class AgentLightningRayPPOTrainer(RayPPOTrainer):
+         )
+ 
+         if is_train:
+-            out, metrics = rollout_adapter.get_train_data_batch(
+-                completed_rollouts,
+-                global_steps=self.global_steps,
+-            )
++            try:
++                out, metrics = rollout_adapter.get_train_data_batch(
++                    completed_rollouts,
++                    global_steps=self.global_steps,
++                )
++            except ValueError as exc:
++                if "all rollouts were rejected by reward guard" not in str(exc):
++                    raise
++                print(f"WARNING: skipping training step because reward guard rejected every rollout: {exc}", flush=True)
++                out = DataProto(batch=None)
++                metrics = {
++                    "training/n_rollouts_rejected_all_by_reward_guard": len(completed_rollouts),
++                    "training/n_sample_collected": 0,
++                    "training/n_sample_trained": 0,
++                }
+             metrics.update(async_rollout_metrics)
+             metrics.update(self._rollout_lifecycle_metrics(completed_rollouts))
+         else:
+@@ -476,6 +626,9 @@ class AgentLightningRayPPOTrainer(RayPPOTrainer):
+                     self.async_rollout_manager.stop_profile()  # pyright: ignore[reportAttributeAccessIssue]
+             metrics.update(agent_metrics)
+         metrics["timing/rollout_phase_end_wall"] = time.time()
++        if gen_batch_output.batch is None:
++            print("AgentLightningRayPPOTrainer: rollout produced no trainable batch; advancing step.")
++            return None
+ 
+         if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+             raise NotImplementedError("REMAX baseline not yet supported in AgentLightningRayPPOTrainer")
+@@ -630,10 +783,23 @@ class AgentLightningRayPPOTrainer(RayPPOTrainer):
+                 critic_output = self._update_critic(batch)
+             metrics.update(reduce_metrics(critic_output.meta_info["metrics"]))
+ 
+-        if self.config.trainer.critic_warmup <= self.global_steps:
++        update_actor = actor_update_allowed(
++            critic_only=self.config.agentlightning.get("critic_only", False),
++            use_critic=self.use_critic,
++            global_steps=self.global_steps,
++            critic_warmup=self.config.trainer.critic_warmup,
++        )
++        metrics["training/actor_update_enabled"] = int(update_actor)
++        if update_actor:
+             with marked_timer("update_actor", timing_raw, color="red"):
+                 actor_output = self._update_actor(batch)
+             metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
++            grad_norm = metrics.get("actor/grad_norm")
++            advantage = metrics.get("critic/advantages/mean", metrics.get("advantages/mean"))
++            print(
++                f"WEIGHT_MONITOR step={self.global_steps} grad_norm={grad_norm} advantage_mean={advantage}",
++                flush=True,
++            )
+ 
+         with marked_timer("update_weights", timing_raw, color="red"):
+             self.checkpoint_manager.update_weights(self.global_steps)  # pyright: ignore[reportOptionalMemberAccess]
+@@ -645,11 +811,18 @@ class AgentLightningRayPPOTrainer(RayPPOTrainer):
+     def fit(self):
+         """Training loop driven by AglRolloutManager for rollouts."""
+ 
++        # Reject an invalid critic-only configuration before sampling any data.
++        actor_update_allowed(
++            critic_only=self.config.agentlightning.get("critic_only", False),
++            use_critic=self.use_critic,
++            global_steps=0,
++            critic_warmup=self.config.trainer.critic_warmup,
++        )
+         logger = Tracking(
+             project_name=self.config.trainer.project_name,
+             experiment_name=self.config.trainer.experiment_name,
+             default_backend=self.config.trainer.logger,
+-            config=OmegaConf.to_container(self.config, resolve=True),
++            config=redact_tracking_config(OmegaConf.to_container(self.config, resolve=True)),
+         )
+ 
+         self.global_steps = 0
+diff --git a/agentlightning/verl/training_phase.py b/agentlightning/verl/training_phase.py
+new file mode 100644
+index 0000000..6c46b0a
+--- /dev/null
++++ b/agentlightning/verl/training_phase.py
+@@ -0,0 +1,20 @@
++# Copyright (c) Microsoft. All rights reserved.
++
++"""Explicit actor-update interlock for critic-only warmup runs."""
++from __future__ import annotations
++
++
++def actor_update_allowed(*, critic_only: bool, use_critic: bool, global_steps: int, critic_warmup: int) -> bool:
++    """A critic-only run never transitions to actor updates based on step count.
++
++    Advancing beyond this phase requires a separately validated configuration;
++    this function does not claim that a critic has passed quality validation.
++    """
++    if type(critic_only) is not bool or type(use_critic) is not bool:
++        raise ValueError("critic_only and use_critic must be booleans")
++    for name, value in (("global_steps", global_steps), ("critic_warmup", critic_warmup)):
++        if type(value) is not int or value < 0:
++            raise ValueError(f"{name} must be a nonnegative integer")
++    if critic_only and not use_critic:
++        raise ValueError("critic-only training requires an enabled critic")
++    return not critic_only and global_steps >= critic_warmup

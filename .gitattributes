@@ -1,0 +1,3 @@
+# Preserve manifest bytes and valid blank context lines inside the critic patch.
+/swe_smith/critic_warmup/overlay/** text eol=lf
+/patches/critic-warmup-20261015.diff text eol=lf -whitespace
