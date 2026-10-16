@@ -4185,3 +4185,9 @@ GAE trajectory 还要求多轮 trace 能按 token 前缀合并。attempt6s 发�
 - The serving context remains 51,200 tokens and the per-request generation budget remains 6,144. Smith retries a context-overflow request with a smaller per-turn budget; a task that still cannot continue is rejected rather than scored as zero. The failure was in the training-side dynamic token cap: prompt and response were each allowed up to 51,200, but their concatenated row could be longer.
 - The isolated retry keeps both per-part limits and the serving context unchanged. It sets actor, old-policy logprob, and reference-logprob dynamic batching caps to 102,400, the sum of the configured prompt and response limits. A preflight checks that the model's positional limit covers this bound. This preserves full token/logprob alignment without truncation.
 - Configuration preflight passed and a fresh retry started from the SFT model. Rollout completion, optimizer updates, checkpoint integrity, and quality remain unverified; launch success is not evidence of model improvement.
+
+## Ray color prefixes can hide group metrics from log monitors (2026-10-17)
+
+- The first real GRPO update emitted `GRPO_GROUP_METRICS`, but Ray prepended an ANSI-colored worker/PID tag. A monitor that required the marker at column zero reported no group data even though the trainer had updated.
+- Search for the marker within each line, then parse only the trailing JSON. A regression using a color-prefixed worker line passes; the read-only monitor was restarted with the parser fix without restarting the trainer.
+- The first batch reported 3 zero-advantage groups out of 8. Its output-token, action-mask, and policy-logprob counts all matched at 269,081, with no missing tokens or truncation. This validates observability and one training update, not model quality; keep reporting group coverage and reward distribution on later steps.
