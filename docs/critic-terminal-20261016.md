@@ -26,9 +26,12 @@ build agent真正stop才可终止；compaction继续主任务，未知或导出�
 - 发布包48个overlay哈希及核心补丁逆向检查通过；包内27个回归模块在本地为
   373 passed、9 skipped。另一个 `test_agl_rollout_manager` 模块因本地缺少
   `httpx_retries` 未运行，没有为此安装或升级依赖。
-- 隔离v9快照和独立ConfigMap已部署，两条真实留出任务正在做完整链路烟测。
-  **尚未完成真实轨迹评分/GAE/value验收，不代表critic质量通过。**
+- 隔离v9快照的真实烟测已走通主任务终止、结构化评分、token/logprob对齐与
+  初始化/step200的有限value推理；runner超时轨迹被拒绝，不补零。
+  两轮各只有一个批准样本，不能合并当作独立质量评估。
+- 固定留出集的四卡双分片评估正在运行；最终质量指标尚未产生，actor继续禁用。
+  详见[独立评估进展与边界](critic-value-eval-20261016.md)。
 
 框架核心补丁保持不变；overlay新增helper和测试，并更新agent及manifest。
 应用方式仍见[critic包说明](../swe_smith/critic_warmup/README.md)。完成真实任务验收
-后再重新采集固定留出名单，不使用此前摘要终止轨迹补足负样本，不自动重开训练。
+后重新采集固定留出名单，不使用此前摘要终止轨迹补足负样本，不自动重开训练。
