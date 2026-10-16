@@ -4153,3 +4153,10 @@ GAE trajectory 还要求多轮 trace 能按 token 前缀合并。attempt6s 发�
 - 后续step 5首次完成critic更新：2条合格样本，loss=11.6875、grad norm=234.15（有限），actor update=0、42层attention冻结。微批EV=-145，单批指标不能判断质量；step20才首次保存，审计时 checkpoint 尚未到期。
 - 后续累计17条归档，11条批准、6条因上下文/格式限制拒绝；317个模型请求仍全部对齐。拒绝数值不进入训练目标，待后续完整checkpoint与独立评估再判断critic效果。
 - SwanLab云端已读回step 5/6/8，actor update=0、critic-only配置及凭据脱敏均通过；step 8 loss=6.2109、grad norm=129.52、EV=-149。运行仍在早期阶段，单批EV波动不作质量结论，后续重点是有效轨迹覆盖及完整step-20 checkpoint。
+
+## 2026-10-17 — Smith critic 的空批次处理与重试状态
+
+- Fresh Smith-native critic run 在第10个尝试步遇到一批两条 rollout：一条因结构化奖励守卫拒绝，另一条因 GAE trace prefix mismatch 被跳过。没有可训练行；原 adapter 抛出运行时错误并结束进程，首个 step-20 checkpoint 尚未产生。拒绝轨迹没有被作为零奖励训练。
+- 修复将唯一的“零训练行”信号作为可识别错误交给 trainer；trainer 跳过这批并且不更新参数。奖励资格检查、prefix 检查、上下文与生成限制都维持 fail-closed；未知异常仍退出。CPU 回归 13 项通过。
+- 新独立快照和 Smith-only ConfigMap 通过预检后，从基座启动新的有界 run。仍使用原生 SWE-smith、追加式消息历史、显式关闭压缩、actor LR=0 与冻结 critic attention。启动通过不代表训练健康；后续还要核实有效 rollout、critic 更新、token/logprob 对齐和 step-20 原子 checkpoint。
+- 两个 vLLM 请求因“prompt+completion 超过固定 context window”被拒绝。它们不是有效负样本；不通过压缩、截断或扩大生成预算来掩盖上下文上限。
