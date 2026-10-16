@@ -355,6 +355,8 @@ def main() -> int:
         "--auto",
         "--format",
         "json",
+        "--agent",
+        "build",
         "--dir",
         "/testbed",
         "-m",
@@ -371,6 +373,7 @@ def main() -> int:
         proc = subprocess.Popen(
             cmd,
             cwd="/testbed",
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=err,
             text=True,
@@ -416,19 +419,23 @@ def main() -> int:
             if event.get("type") == "step_finish":
                 step_count += 1
                 if isinstance(part, dict) and part.get("reason") == "stop":
-                    terminal_seen = True
-                    log.info("opencode terminal stop after %d steps; ending rollout before synthetic continue loop", step_count)
-                    try:
-                        os.killpg(proc.pid, signal.SIGTERM)
-                        proc.wait(timeout=5)
-                    except Exception:
+                    from opencode_terminal import classify_terminal_event
+                    terminal_kind = classify_terminal_event(event, binary=OPENCODE_BIN, env=env, cwd="/testbed")
+                    log.info("OPENCODE_TERMINAL_CLASSIFICATION message=%s kind=%s", part.get("messageID"), terminal_kind)
+                    if terminal_kind == "task_stop":
+                        terminal_seen = True
+                        log.info("opencode terminal stop after %d steps; ending rollout before synthetic continue loop", step_count)
                         try:
-                            os.killpg(proc.pid, signal.SIGKILL)
+                            os.killpg(proc.pid, signal.SIGTERM)
+                            proc.wait(timeout=5)
                         except Exception:
-                            pass
-                        proc.wait(timeout=10)
-                    oc_returncode = 0
-                    break
+                            try:
+                                os.killpg(proc.pid, signal.SIGKILL)
+                            except Exception:
+                                pass
+                            proc.wait(timeout=10)
+                        oc_returncode = 0
+                        break
                 if step_count >= MAX_STEPS:
                     log.warning("opencode max steps %d reached; force terminating process group", MAX_STEPS)
                     try:
@@ -467,6 +474,21 @@ def main() -> int:
 
         evaluation = evaluate_structured(smith, eval_meta, eval_timeout, f2p_only=f2p_only)
         termination = validate_opencode_terminal(oc_log, oc_proc.returncode)
+        if termination["trajectory_terminal"]:
+            # A naturally exited CLI may have buffered its final stdout event;
+            # recheck the exact final message rather than trusting reason=stop.
+            from opencode_terminal import classify_terminal_event
+            finish_events = []
+            for line in oc_log.read_text(encoding="utf-8").splitlines():
+                try:
+                    item = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(item, dict) and item.get("type") == "step_finish":
+                    finish_events.append(item)
+            final_kind = classify_terminal_event(finish_events[-1], binary=OPENCODE_BIN, env=env, cwd="/testbed") if finish_events else "unknown"
+            if final_kind != "task_stop":
+                termination.update(trajectory_terminal=False, termination_reason="no_verified_task_terminal")
         evaluation.update(termination)
         if os.environ.get("SMITH_REQUIRE_TERMINAL", "0") == "1" and not termination["trajectory_terminal"]:
             evaluation["reward_eligible"] = False

@@ -12,10 +12,11 @@ PATH = Path(__file__).resolve().parents[3] / "examples/swe_smith/agents/opencode
 
 
 @pytest.mark.parametrize("terminal", [False, True])
+@pytest.mark.parametrize("terminal_kind", ["task_stop", "compaction", "unknown"])
 @pytest.mark.parametrize("runner_rc", [0, 1])
 @pytest.mark.parametrize("structured", [False, True])
 @pytest.mark.parametrize("binary,ratio", [(1.0, 1.0), (0.0, 0.75)])
-def test_main_accepts_five_evaluation_values(tmp_path, monkeypatch, binary, ratio, structured, runner_rc, terminal):
+def test_main_accepts_five_evaluation_values(tmp_path, monkeypatch, binary, ratio, structured, runner_rc, terminal, terminal_kind):
     events, evaluation_calls = [], []
     def evaluate(meta, timeout, *, f2p_only):
         evaluation_calls.append((meta, timeout, f2p_only))
@@ -38,6 +39,8 @@ def test_main_accepts_five_evaluation_values(tmp_path, monkeypatch, binary, rati
     monkeypatch.setenv("SMITH_REQUIRE_TERMINAL", "1")
     monkeypatch.setitem(sys.modules, "structured_eval", SimpleNamespace(evaluate=structured_evaluate))
     monkeypatch.setitem(sys.modules, "smith_agent", smith)
+    monkeypatch.setitem(sys.modules, "opencode_terminal", SimpleNamespace(
+        classify_terminal_event=lambda *args, **kwargs: terminal_kind))
     # The script adds its ConfigMap directory on import; restore the test process.
     monkeypatch.setattr(sys, "path", list(sys.path))
     spec = importlib.util.spec_from_file_location("opencode_contract", PATH)
@@ -75,7 +78,7 @@ def test_main_accepts_five_evaluation_values(tmp_path, monkeypatch, binary, rati
     assert summary["reward"] == binary
     # A terminal stop is deliberately ended by the supervisor and normalized to
     # success, even if the process exits nonzero after receiving SIGTERM.
-    eligible = terminal
+    eligible = terminal and terminal_kind == "task_stop"
     assert summary["f2p_ratio"] == (0.0 if structured and not eligible else ratio)
     reward_events = [data for kind, data in events if kind == "reward"]
     assert len(reward_events) == 1

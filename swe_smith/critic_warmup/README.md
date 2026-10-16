@@ -2,7 +2,9 @@
 
 这是独立于历史 GRPO 的 critic 预热线：固定 actor、冻结 critic attention，
 使用 GAE。更新与保存已验证，后续审计发现压缩摘要被误判为任务终止，
-奖励批准语义待修复；step200仅供诊断，禁止自动开启 actor。
+终止判定修复已通过固定版CLI及长导出验证，真实任务烟测进行中；
+step200仍仅供诊断，禁止自动开启 actor。
+详见[终止判定修复与验收边界](../../docs/critic-terminal-20261016.md)。
 
 ## 目录与应用
 
@@ -58,3 +60,8 @@ portable launcher 要求显式传入这些路径，不会自动创建集群或�
 reward/training-phase、behavior token、OpenCode 合约与结构化 grader 的相关测试：
 **175 passed，4 skipped**。跳过项受本地可用依赖/平台能力限制。
 这验证了补丁和 overlay 的依赖及路径，未将 portable launcher 宣称为新的 GPU 验收。
+
+2026-10-16终止判定修复后：48个overlay哈希与核心补丁逆向检查通过；
+本地包内27个模块373 passed、9 skipped，另一个rollout manager模块因缺少
+`httpx_retries`未运行，未升级依赖。针对性终止/长导出/合约/SSE回归64 passed；
+真实任务烟测边界见上方修复说明，不能以软件回归代替critic质量验收。

@@ -7,7 +7,11 @@
     },
     {
       "path": "examples/swe_smith/agents/opencode_agent.py",
-      "sha256": "a8208d099940842146b37535dfc8fe2383bfde2c90d8c26b7b11afea16c26b9f"
+      "sha256": "f49f680f38936acf58bc81073de0591464d58e82392cf3f638c0afe49b67b697"
+    },
+    {
+      "path": "examples/swe_smith/agents/opencode_terminal.py",
+      "sha256": "b03d598ff6cd6dc0debb5c053fe744e832af6e920a2bd560106de63dd60638d8"
     },
     {
       "path": "examples/swe_smith/agents/rollout_termination.py",
@@ -95,11 +99,15 @@
     },
     {
       "path": "fix_qwen35_20261011/sft_eval_patch/tests/test_opencode_eval_contract.py",
-      "sha256": "e13c711ed8e2c61cff04e08318a096eb3bddf3d53291bc8efe968a1267d8b2d4"
+      "sha256": "d26accbf4abc6b187786421f4699b4869829f92391a2b1b474a75136096df893"
     },
     {
       "path": "fix_qwen35_20261011/sft_eval_patch/tests/test_opencode_proxy_sse.py",
       "sha256": "09e31679cbc118ccaacd8006285983c9d182f7ed50940934ab07c667cd7d6616"
+    },
+    {
+      "path": "fix_qwen35_20261011/sft_eval_patch/tests/test_opencode_terminal_metadata.py",
+      "sha256": "8008fbb3f6e0e7a657e395cf1a45694ff5a8bd4f1337facd088835e4d37d3b07"
     },
     {
       "path": "fix_qwen35_20261011/sft_eval_patch/tests/test_results_gate.py",

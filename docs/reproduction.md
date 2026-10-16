@@ -29,7 +29,7 @@ python -m pytest tests/verl/test_critic_atomic_save.py tests/verl/test_critic_ch
 python examples/swe_smith/run_critic_lowmem.py --help
 ```
 
-检查器验证精确基线、干净工作区、补丁可应用性及46个overlay文件SHA256。更完整的测试范围和真实GPU验收边界见 [critic包说明](../swe_smith/critic_warmup/README.md)。某些回归依赖训练环境，skip不代表对应GPU能力已被本机验证。
+检查器验证精确基线、干净工作区、补丁可应用性及48个overlay文件SHA256。更完整的测试范围和真实GPU验收边界见 [critic包说明](../swe_smith/critic_warmup/README.md)。某些回归依赖训练环境，skip不代表对应GPU能力已被本机验证。
 
 launcher要求显式模型/数据/job-template/parser/chat-template路径及AGL密钥文件，SwanLab密钥经环境传入。保持actor禁用、attention冻结；用独立supervisor监测奖励供给、有限梯度和磁盘余量。最近checkpoint约22.2GiB，原子发布需临时容纳新旧两份；当前实验data准入64GiB、运行保护32GiB。不足时停止，不转移到根分区。
 
