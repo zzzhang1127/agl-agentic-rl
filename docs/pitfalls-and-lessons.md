@@ -4160,3 +4160,9 @@ GAE trajectory 还要求多轮 trace 能按 token 前缀合并。attempt6s 发�
 - 修复将唯一的“零训练行”信号作为可识别错误交给 trainer；trainer 跳过这批并且不更新参数。奖励资格检查、prefix 检查、上下文与生成限制都维持 fail-closed；未知异常仍退出。CPU 回归 13 项通过。
 - 新独立快照和 Smith-only ConfigMap 通过预检后，从基座启动新的有界 run。仍使用原生 SWE-smith、追加式消息历史、显式关闭压缩、actor LR=0 与冻结 critic attention。启动通过不代表训练健康；后续还要核实有效 rollout、critic 更新、token/logprob 对齐和 step-20 原子 checkpoint。
 - 两个 vLLM 请求因“prompt+completion 超过固定 context window”被拒绝。它们不是有效负样本；不通过压缩、截断或扩大生成预算来掩盖上下文上限。
+
+## Native Smith critic retry: cached image and empty-batch handling (2026-10-17)
+
+- The fresh run uses the native SWE-smith agent with conversation compaction disabled. A SunPy pod first reported `ErrImageNeverPull`; the image was already cached on the node, and kubelet subsequently started it from the local cache. Inspect pod events and node cache before changing image policy or restarting services.
+- The first two rollout batches each had too few reward-eligible rows after fail-closed filtering, so the trainer skipped them without an optimizer update and continued. A context-overflow result was rejected rather than converted to a zero reward.
+- At this checkpoint, one complete positive-reward rollout from the third batch was archived, its partner was still running, and no critic update or step-20 checkpoint existed. Startup and a successful task are not proof of a healthy training run; verify eligible batch consumption, token/logprob alignment, finite updates, cloud metrics, and atomic checkpoint integrity.
