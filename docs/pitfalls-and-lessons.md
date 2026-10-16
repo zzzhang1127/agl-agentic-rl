@@ -4199,3 +4199,9 @@ GAE trajectory 还要求多轮 trace 能按 token 前缀合并。attempt6s 发�
 - Tool execution and tool-feedback follow-up counters matched. A three-repeat guard stopped repeated-output rollouts. These are data-integrity checks, not evidence of benchmark improvement; quality still requires the fixed held-out probe.
 - The tracking service returned both optimizer steps, their zero-advantage fractions, learning rate, KL coefficient, and finite gradient norms; the values matched the local log. The run remains in progress, with no checkpoint or held-out result yet.
 - A third update is now visible locally and in tracking: 1 of 7 groups had zero advantage, and all 260,410 generated action tokens matched action-mask and policy-logprob counts. There are still no negative-reward examples, so the observed rewards do not establish policy improvement.
+
+## Partial rollout archives are not token-count mismatches (2026-10-17)
+
+- A mid-flight archive can contain model-request events and token/logprob triplets but no final reward event. The fail-closed reward gate rejects it; partial data must not enter GRPO advantages.
+- A read-only monitor that defaults a missing final output count to zero can incorrectly report a triplet-count mismatch. Count missing terminal metadata separately, and compare request/triplet counts only when a terminal output count exists. Per-update generated-token, action-mask, and policy-logprob conservation remains the training-path integrity check.
+- A regression now covers partial archives without reward metadata. The monitor-only change was validated and deployed without restarting the trainer.
