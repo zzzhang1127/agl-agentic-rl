@@ -4205,3 +4205,9 @@ GAE trajectory 还要求多轮 trace 能按 token 前缀合并。attempt6s 发�
 - A mid-flight archive can contain model-request events and token/logprob triplets but no final reward event. The fail-closed reward gate rejects it; partial data must not enter GRPO advantages.
 - A read-only monitor that defaults a missing final output count to zero can incorrectly report a triplet-count mismatch. Count missing terminal metadata separately, and compare request/triplet counts only when a terminal output count exists. Per-update generated-token, action-mask, and policy-logprob conservation remains the training-path integrity check.
 - A regression now covers partial archives without reward metadata. The monitor-only change was validated and deployed without restarting the trainer.
+
+## GPU contention and unsafe automatic restart (2026-10-17)
+
+- A distributed policy update can fail during backward even when rollout, scoring, and token-alignment checks passed. Treat a CUDA OOM as a failed update; do not count the step or infer a reward outcome.
+- If the run has not produced a complete atomic checkpoint, a supervisor must stop rather than resume from partial state. Preserve the failed-run evidence and inspect free memory on every assigned device before any separately named fresh retry. Never terminate another workload to make room.
+- Cloud tracking can remain marked RUNNING after the local driver exits. Confirm the supervisor, driver, exit record, and checkpoint on the host before reporting liveness.
