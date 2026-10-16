@@ -4191,3 +4191,9 @@ GAE trajectory 还要求多轮 trace 能按 token 前缀合并。attempt6s 发�
 - The first real GRPO update emitted `GRPO_GROUP_METRICS`, but Ray prepended an ANSI-colored worker/PID tag. A monitor that required the marker at column zero reported no group data even though the trainer had updated.
 - Search for the marker within each line, then parse only the trailing JSON. A regression using a color-prefixed worker line passes; the read-only monitor was restarted with the parser fix without restarting the trainer.
 - The first batch reported 3 zero-advantage groups out of 8. Its output-token, action-mask, and policy-logprob counts all matched at 269,081, with no missing tokens or truncation. This validates observability and one training update, not model quality; keep reporting group coverage and reward distribution on later steps.
+
+## Failed rollouts must not become zero-reward samples (2026-10-17)
+
+- A rollout container ended with exit 143 and its Kubernetes job reached `BackoffLimitExceeded` without a final structured score. The reward gate rejected it; the unresolved infrastructure failure was not converted into a model score of zero.
+- On the next valid update, 283,175 generated action tokens matched the training action mask and policy-logprob slots. Missing IDs/logprobs, length mismatches, and truncations were all zero. Five groups had no zero-advantage group; the preceding update had three of eight, so the group-level distribution remains a per-update health metric.
+- Tool execution and tool-feedback follow-up counters matched. A three-repeat guard stopped repeated-output rollouts. These are data-integrity checks, not evidence of benchmark improvement; quality still requires the fixed held-out probe.
