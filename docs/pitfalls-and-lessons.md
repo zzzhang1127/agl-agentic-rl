@@ -4142,3 +4142,11 @@ GAE trajectory 还要求多轮 trace 能按 token 前缀合并。attempt6s 发�
 上下文问题仍未彻底解决。`max_model_len=51200` 在 4 卡 actor/ref/critic 常驻时 vLLM KV cache 不够；`24576 + 4096/2048 completion` 能启动，但 OpenCode 仍会偶发请求超过窗口。把 pod 侧 `AGL_OPENCODE_CONTEXT` 从 24576 降到 20480 只能减少溢出，不能保证所有题都不过界。
 
 最后因为同事紧急需要 CUDA 5，本会话启动的 attempt6t 已手动停止，Ray/vLLM/WorkerDict 进程已清掉。当前不能再用 CUDA 5 继续 smoke；下一次要么等 4 张大空闲卡恢复，要么改成 2 卡更小 smoke 验证 critic-only checkpoint，不要抢同事的卡。
+
+## 2026-10-16 — Smith 原生 critic 重启的早期经验
+
+- 旧 step-200 权重因训练采样终止语义存在风险，按用户授权删除；新运行从基础模型开始。训练采用 SWE-smith 原生 agent，消息历史只追加，显式关闭压缩，不经过 OpenCode。
+- 首次启动在采样前失败：critic-only loader 不接受自动恢复模式。Fresh run 使用 `resume_mode=disable`；恢复时必须先校验本次运行自己的完整 checkpoint，再传明确路径。初始化失败不能计作训练更新。
+- 第二次运行的中途审计覆盖 7 条归档：3 条明确提交且结构化评分完整，4 条因格式/上下文限制被拒绝。拒绝轨迹中记录的 reward 数字 0 不是有效负样本，必须由 eligibility gate 排除。
+- 119 个归档模型请求的 token ID 与 logprob 长度一致。vLLM 会提示忽略未知的 `return_token_ids` 请求字段，因此应检查归档里实际生成的 token IDs 和 logprobs，不能只依赖请求参数。
+- 该审计时点尚无 critic 更新或 checkpoint。任务终止和评分通过、数据进入归档、trainer 完成一次优化更新是三个不同的验收点；只报告已观察到的阶段。训练质量还需独立留出评估，actor 保持关闭。
