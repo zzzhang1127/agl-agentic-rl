@@ -4150,3 +4150,5 @@ GAE trajectory 还要求多轮 trace 能按 token 前缀合并。attempt6s 发�
 - 第二次运行的中途审计覆盖 7 条归档：3 条明确提交且结构化评分完整，4 条因格式/上下文限制被拒绝。拒绝轨迹中记录的 reward 数字 0 不是有效负样本，必须由 eligibility gate 排除。
 - 119 个归档模型请求的 token ID 与 logprob 长度一致。vLLM 会提示忽略未知的 `return_token_ids` 请求字段，因此应检查归档里实际生成的 token IDs 和 logprobs，不能只依赖请求参数。
 - 该审计时点尚无 critic 更新或 checkpoint。任务终止和评分通过、数据进入归档、trainer 完成一次优化更新是三个不同的验收点；只报告已观察到的阶段。训练质量还需独立留出评估，actor 保持关闭。
+- 后续step 5首次完成critic更新：2条合格样本，loss=11.6875、grad norm=234.15（有限），actor update=0、42层attention冻结。微批EV=-145，单批指标不能判断质量；step20才首次保存，审计时 checkpoint 尚未到期。
+- 后续累计10条归档，5条批准、5条因上下文/格式限制拒绝；167个模型请求仍全部对齐。拒绝数值不进入训练目标，待后续完整checkpoint与独立评估再判断critic效果。
