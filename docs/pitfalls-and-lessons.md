@@ -4172,3 +4172,9 @@ GAE trajectory 还要求多轮 trace 能按 token 前缀合并。attempt6s 发�
 - The fresh, no-compaction Smith run reached its first real critic optimizer update at attempt step 5 using two complete, reward-eligible submissions. The finite metrics were value loss 13.77 and gradient norm 304.12; explained variance was -580 and the tiny batch contained only positive rewards, so this confirms the update path runs but does not establish critic quality.
 - SwanLab read back the same step and metrics, confirmed critic-only mode and redacted credentials. Actor updates remain disabled, and all attention layers remain frozen.
 - The first two batches were skipped after fail-closed filtering left too few rows. Context-overflow rollouts were rejected, not converted to zero-reward examples. The run continues toward its first atomic checkpoint at step 20; quality remains unverified.
+
+## Mixed-reward batch and alignment audit (2026-10-17)
+
+- The second real critic update used one eligible positive and one eligible zero-reward Smith submission: reward mean 0.5, value loss 11.98, grad norm 247.35, and explained variance -175. The prior update had reward mean 1.0, loss 13.77, grad norm 304.12, and explained variance -580. Both updates were finite and actor updates remained zero; these tiny early batches do not establish value quality.
+- Of 12 completed rollouts, 9 had complete terminal submissions (7 positive, 2 zero) and 3 context-overflow attempts were rejected. All 256 archived model requests had token IDs aligned with logprobs; no training truncation was recorded. Three batches were safely skipped for insufficient eligible rows; two batches updated the critic.
+- Cloud readback matched local steps 5 and 6, with critic-only settings and redacted credentials. The first full checkpoint at step 20 is still pending.
