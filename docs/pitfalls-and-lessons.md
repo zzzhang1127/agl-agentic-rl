@@ -4166,3 +4166,9 @@ GAE trajectory 还要求多轮 trace 能按 token 前缀合并。attempt6s 发�
 - The fresh run uses the native SWE-smith agent with conversation compaction disabled. A SunPy pod first reported `ErrImageNeverPull`; the image was already cached on the node, and kubelet subsequently started it from the local cache. Inspect pod events and node cache before changing image policy or restarting services.
 - The first two rollout batches each had too few reward-eligible rows after fail-closed filtering, so the trainer skipped them without an optimizer update and continued. A context-overflow result was rejected rather than converted to a zero reward.
 - At this checkpoint, one complete positive-reward rollout from the third batch was archived, its partner was still running, and no critic update or step-20 checkpoint existed. Startup and a successful task are not proof of a healthy training run; verify eligible batch consumption, token/logprob alignment, finite updates, cloud metrics, and atomic checkpoint integrity.
+
+## First critic update from native Smith rollouts (2026-10-17)
+
+- The fresh, no-compaction Smith run reached its first real critic optimizer update at attempt step 5 using two complete, reward-eligible submissions. The finite metrics were value loss 13.77 and gradient norm 304.12; explained variance was -580 and the tiny batch contained only positive rewards, so this confirms the update path runs but does not establish critic quality.
+- SwanLab read back the same step and metrics, confirmed critic-only mode and redacted credentials. Actor updates remain disabled, and all attention layers remain frozen.
+- The first two batches were skipped after fail-closed filtering left too few rows. Context-overflow rollouts were rejected, not converted to zero-reward examples. The run continues toward its first atomic checkpoint at step 20; quality remains unverified.
