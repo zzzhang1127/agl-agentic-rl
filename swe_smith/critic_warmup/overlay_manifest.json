@@ -39,7 +39,7 @@
     },
     {
       "path": "examples/swe_smith/job-template-critic-smoke.yaml",
-      "sha256": "1850f8724963198ba0cae09a6f1366d8782c9aee0a370ed47e0db19623f0c65e"
+      "sha256": "338034319b1d04787e3fff0860c5d8fb821e350e08d5d6f5c1518cf51fb553e4"
     },
     {
       "path": "examples/swe_smith/job-template-openai.yaml",
@@ -47,7 +47,7 @@
     },
     {
       "path": "examples/swe_smith/job-template-opencode.yaml",
-      "sha256": "1a618c6e5f05fecb412d68de1d62373f3a68fbb30d0fe50f99caeb2652ebd01b"
+      "sha256": "51f02ea6123429e974cfca4b6dd284c7111f534343cd25874fcc063ac8d60b7e"
     },
     {
       "path": "examples/swe_smith/opencode_smoke/eval_inside.py",

@@ -29,6 +29,7 @@ python -m pytest tests/verl/test_critic_atomic_save.py tests/verl/test_critic_ch
 依赖仍沿用项目已验证的训练环境；这里不安装或升级依赖。真实 GPU 运行还需要
 匹配的 MiniCPM runtime/parser/chat template、AGL 服务、任务镜像和 ConfigMap，
 portable launcher 要求显式传入这些路径，不会自动创建集群或下载模型。
+模板中的 `<LAN_IP>` 必须替换为容器可访问的宿主机地址；模板不包含实验服务器的地址。
 
 ## 已完成与未完成
 
@@ -44,9 +45,10 @@ portable launcher 要求显式传入这些路径，不会自动创建集群或�
 - 低显存双卡配置、保存间隔及最新质量结果见
   [2026-10-15 实验记录](../../docs/critic-warmup-20261015.md)。
 
-截至记录时，最后执行到 step59，磁盘保护后唯一完整 checkpoint 为 step40，
-未保存的 41–59 不能恢复。解释方差仍负，32 train / 1 validation 只够诊断；
-没有达到可开 actor 的质量门槛，也没有宣称 VAL474 提升。
+2026-10-16 已从完整 step40 续训并自然完成到 step200，新增155次有效更新，
+唯一完整 checkpoint 已原子替换为 step200。训练仍使用32 train / 1 validation，
+独立 value 评估正在进行，尚未达到可开 actor 的质量门槛，也没有宣称 VAL474 提升。
+完整的工程验收与质量边界见 [step200最终记录](../../docs/critic-final-20261016.md)。
 
 ## 发布包验证
 

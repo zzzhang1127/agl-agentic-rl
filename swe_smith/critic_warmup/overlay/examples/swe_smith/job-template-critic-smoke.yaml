@@ -14,7 +14,7 @@ spec:
     spec:
       restartPolicy: Never
       hostAliases:
-        - ip: "172.17.20.63"
+        - ip: "<LAN_IP>"
           hostnames:
             - "host.docker.internal"
       containers:
