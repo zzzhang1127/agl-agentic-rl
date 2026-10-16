@@ -27,7 +27,7 @@
     },
     {
       "path": "examples/swe_smith/critic_storage.py",
-      "sha256": "74bfb731680430f9945df95c1d0b78d579bafe7064b927968ea18ae95830f180"
+      "sha256": "c0c8c06257928a2c659486e7440110c7c10f1cfc289507d47c30c9ed1b1846ce"
     },
     {
       "path": "examples/swe_smith/critic_warmup.yaml",
@@ -63,7 +63,7 @@
     },
     {
       "path": "examples/swe_smith/run_critic_lowmem.py",
-      "sha256": "e7c52a103c82dc940a33d952d4d879495af8c794112bdd463e8904ddf1ea4c78"
+      "sha256": "8095503edeafb05da2c0f909c917c61cd663f947c877c2d13d7e96d6250b1f72"
     },
     {
       "path": "examples/swe_smith/train_opencode_agent.py",
@@ -131,7 +131,7 @@
     },
     {
       "path": "tests/examples/test_critic_storage.py",
-      "sha256": "74a6161c7b8797a3fefcfca10e66b638a5d91a9ae0e2cd10892272b847283674"
+      "sha256": "bade43ce400b2475db4e81697ab72e8c02b3adadacf5530bb7d50c4f802e67a6"
     },
     {
       "path": "tests/examples/test_smith_loop_guard.py",

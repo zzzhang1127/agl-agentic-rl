@@ -23,7 +23,8 @@ def test_long_run_keeps_socket_path_short(monkeypatch):
     env = storage.runtime_environment(str(project), "run" * 70, data_root=str(root))
     assert len(Path(env["RAY_TMPDIR"]).name) == 13
     assert all(Path(value).is_relative_to(root) and Path(value) in created for value in env.values())
-    assert {"HF_HOME", "TORCH_HOME", "TRITON_CACHE_DIR", "AGL_COMPLETED_ROLLOUT_ARCHIVE"} <= env.keys()
+    assert {"HF_HOME", "TORCH_HOME", "TRITON_CACHE_DIR", "AGL_COMPLETED_ROLLOUT_ARCHIVE",
+            "CUDA_CACHE_PATH", "FLASHINFER_WORKSPACE_BASE"} <= env.keys()
 
 
 def test_symlink_escape_rejected_before_creation(tmp_path):

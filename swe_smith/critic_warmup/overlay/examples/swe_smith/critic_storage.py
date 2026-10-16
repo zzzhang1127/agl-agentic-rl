@@ -30,6 +30,7 @@ def runtime_environment(project_dir: str, run_name: str, *, data_root: str = "/d
         "XDG_CACHE_HOME": "xdg", "HF_HOME": "huggingface", "TORCH_HOME": "torch",
         "TRITON_CACHE_DIR": "triton", "TORCHINDUCTOR_CACHE_DIR": "inductor",
         "TORCH_EXTENSIONS_DIR": "extensions", "VLLM_CACHE_ROOT": "vllm",
+        "CUDA_CACHE_PATH": "cuda", "FLASHINFER_WORKSPACE_BASE": "flashinfer",
     }.items():
         paths[key] = project / "runtime_cache" / name
     # Validate every final target before creating anything, including preexisting symlinks.

@@ -8,6 +8,8 @@
 4. [critic工程验收](critic-warmup-20261015.md)：恢复、原子保存、显存配置与质量限制。
 5. [历史实验笔记](pitfalls-and-lessons.md)：按日期保留假设、故障与修复证据。
 
+最新运行更新：[2026-10-16 critic续训](critic-resume-20261016.md)，含数据盘保护策略修正与首个有效更新。
+
 ## 按问题找入口
 
 - 单轮GRPO是否有效：[GSM8K结果与日志](../gsm8k/README.md)。

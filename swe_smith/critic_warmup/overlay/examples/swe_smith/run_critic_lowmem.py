@@ -90,7 +90,7 @@ def main():
     for name in ("model", "train_data", "val_data", "job_template", "parser_plugin", "chat_template", "agl_key_file"):
         if not Path(getattr(args, name)).exists():
             parser.error("missing runtime input: " + name)
-    if shutil.disk_usage("/data").free < 64 * 1024**3 or shutil.disk_usage("/").free < 12 * 1024**3:
+    if shutil.disk_usage("/data").free < 64 * 1024**3:
         parser.error("insufficient disk headroom; no root-filesystem fallback")
     if not os.environ.get("SWANLAB_API_KEY"):
         parser.error("SWANLAB_API_KEY must be supplied through the environment")

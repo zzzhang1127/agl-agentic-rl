@@ -33,6 +33,8 @@ python examples/swe_smith/run_critic_lowmem.py --help
 
 launcher要求显式模型/数据/job-template/parser/chat-template路径及AGL密钥文件，SwanLab密钥经环境传入。保持actor禁用、attention冻结；用独立supervisor监测奖励供给、有限梯度和磁盘余量。最近checkpoint约22.2GiB，原子发布需临时容纳新旧两份；当前实验data准入64GiB、运行保护32GiB。不足时停止，不转移到根分区。
 
+2026-10-16修正：所有运行产物写入数据盘后，根分区余量只作观测，不再作为额外启动/停训阈值。CUDA与FlashInfer缓存也显式指向数据盘。见[续训验收记录](critic-resume-20261016.md)。
+
 ## 路径B：历史GRPO与GSM8K
 
 历史框架补丁为 [patches/agentlightning-core.diff](../patches/agentlightning-core.diff)，应用到另一个干净的上游218f1f7c checkout。步骤及verl补丁见 [patches/README.md](../patches/README.md)。不要在路径A的checkout上重复套用。
