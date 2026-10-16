@@ -4211,3 +4211,15 @@ GAE trajectory 还要求多轮 trace 能按 token 前缀合并。attempt6s 发�
 - A distributed policy update can fail during backward even when rollout, scoring, and token-alignment checks passed. Treat a CUDA OOM as a failed update; do not count the step or infer a reward outcome.
 - If the run has not produced a complete atomic checkpoint, a supervisor must stop rather than resume from partial state. Preserve the failed-run evidence and inspect free memory on every assigned device before any separately named fresh retry. Never terminate another workload to make room.
 - Cloud tracking can remain marked RUNNING after the local driver exits. Confirm the supervisor, driver, exit record, and checkpoint on the host before reporting liveness.
+
+## 2026-10-17 retry5 GPU mapping clarification
+
+- The OOM traceback identifies a worker-visible GPU index, but does not establish which physical GPU that worker used. Do not map that index to physical GPU 2 based only on the traceback. A later host snapshot shows physical GPU 6 with about 40 GiB free and another process using about 56 GiB; whether this is the same device involved in the OOM cannot be proven from the captured log.
+
+## 2026-10-17 retry5 GPU mapping clarification
+
+- The OOM traceback identifies a worker-visible GPU index, but does not establish which physical GPU that worker used. Do not map that index to physical GPU 2 based only on the traceback. A later host snapshot shows physical GPU 6 with about 40 GiB free and another process using about 56 GiB; whether this is the same device involved in the OOM cannot be proven from the captured log.
+
+## 2026-10-17 retry5 GPU mapping clarification
+
+- Correction to the earlier OOM note: the traceback reports a worker-visible GPU index, but does not prove which physical GPU that worker used. A later host snapshot showed physical GPU 6 with about 40 GiB free and another process using about 56 GiB; the saved evidence cannot prove whether that is the same device involved in the OOM.
