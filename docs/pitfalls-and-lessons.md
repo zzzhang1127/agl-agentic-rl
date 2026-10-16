@@ -4152,3 +4152,4 @@ GAE trajectory 还要求多轮 trace 能按 token 前缀合并。attempt6s 发�
 - 该审计时点尚无 critic 更新或 checkpoint。任务终止和评分通过、数据进入归档、trainer 完成一次优化更新是三个不同的验收点；只报告已观察到的阶段。训练质量还需独立留出评估，actor 保持关闭。
 - 后续step 5首次完成critic更新：2条合格样本，loss=11.6875、grad norm=234.15（有限），actor update=0、42层attention冻结。微批EV=-145，单批指标不能判断质量；step20才首次保存，审计时 checkpoint 尚未到期。
 - 后续累计10条归档，5条批准、5条因上下文/格式限制拒绝；167个模型请求仍全部对齐。拒绝数值不进入训练目标，待后续完整checkpoint与独立评估再判断critic效果。
+- 下一次云端读回确认step 5和6、actor update=0、critic-only配置及凭据脱敏均已写入SwanLab；step 6 loss=8.5078、grad norm=164.26、EV=-21.75。运行仍在早期阶段，单批EV波动不作质量结论，后续重点是有效轨迹覆盖及完整step-20 checkpoint。
