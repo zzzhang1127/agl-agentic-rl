@@ -1,7 +1,8 @@
 # MiniCPM5 SAO/PPO critic-only warmup
 
 这是独立于历史 GRPO 的 critic 预热线：固定 actor、冻结 critic attention，
-使用 GAE。工程链路已跑通，value 质量仍未达标，禁止自动开启 actor。
+使用 GAE。更新与保存已验证，后续审计发现压缩摘要被误判为任务终止，
+奖励批准语义待修复；step200仅供诊断，禁止自动开启 actor。
 
 ## 目录与应用
 
