@@ -19,3 +19,9 @@
 使用已有 SwanLab 环境运行 `python swe_smith/probes/swanlab_health.py --help` 查看参数；`--run` 使用 `workspace/project/run-id`，`--output` 指定新的 JSON 文件。认证使用 `SWANLAB_API_KEY` 环境变量或 SwanLab 已保存的认证，避免把密钥写进命令行或仓库。
 
 该工具已用原生 GRPO 活跃运行的 step1–4 真实云端数据验证；本地回归覆盖敏感值不导出、脱敏标记、缺失 profile、固定指标选择和未解析配置。实现依赖已安装 SDK 的 `Api.run` / `Experiment.metrics` 接口，不自动安装或升级依赖。
+
+## 已完成轨迹的读取
+
+[archive_json.py](archive_json.py) 提供 `iter_json_archives(root)` 和 `read_json_archive(path)`，兼容UTF-8 JSON与gzip归档。压缩发布期间同一文件的两种表示只计一次；遍历后原JSON被删除时，会读取已经发布的gzip。损坏或截断的gzip抛出异常，调用方必须单列读取错误，不能补成空轨迹或零奖励。
+
+该模块只读取，不压缩或删除文件。启用历史归档压缩前，必须先核对所有消费者的兼容性，验证解压SHA及gzip CRC，再发布gzip并替换原文件。当前训练run的原始归档尚未压缩：其现有监督器仍按纯JSON扫描，不能只更新一个读取工具就对所有活跃数据启用压缩。
