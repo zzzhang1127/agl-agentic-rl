@@ -4214,12 +4214,12 @@ GAE trajectory 还要求多轮 trace 能按 token 前缀合并。attempt6s 发�
 
 ## 2026-10-17 retry5 GPU mapping clarification
 
-- The OOM traceback identifies a worker-visible GPU index, but does not establish which physical GPU that worker used. Do not map that index to physical GPU 2 based only on the traceback. A later host snapshot shows physical GPU 6 with about 40 GiB free and another process using about 56 GiB; whether this is the same device involved in the OOM cannot be proven from the captured log.
+- The traceback reports a worker-visible GPU index. Establish the physical device with that worker's device mapping; do not infer it from an index or a later host snapshot. Preserve evidence without interfering with unrelated workloads.
 
-## 2026-10-17 retry5 GPU mapping clarification
+## Completed updates, reply reserves, and end-to-end token accounting (2026-10-17)
 
-- The OOM traceback identifies a worker-visible GPU index, but does not establish which physical GPU that worker used. Do not map that index to physical GPU 2 based only on the traceback. A later host snapshot shows physical GPU 6 with about 40 GiB free and another process using about 56 GiB; whether this is the same device involved in the OOM cannot be proven from the captured log.
-
-## 2026-10-17 retry5 GPU mapping clarification
-
-- Correction to the earlier OOM note: the traceback reports a worker-visible GPU index, but does not prove which physical GPU that worker used. A later host snapshot showed physical GPU 6 with about 40 GiB free and another process using about 56 GiB; the saved evidence cannot prove whether that is the same device involved in the OOM.
+- Retry7 completed one optimizer step before failing during the next backward pass. The completed step logged finite gradients and 247,949 generated/action-mask/logprob tokens. A partial log tail initially hid this update; search complete `step:N` records and parameter-change diagnostics rather than interpreting rollout-group records as completed updates. No checkpoint was published before the failure.
+- A training-data prompt-length setting does not enforce the live agent's request budget. An agent that shrinks its completion budget after a context error does not preserve the full final-reply reserve. The new opt-in reserve mode ends the episode at that limit without rewriting history or appending an empty assistant output. Such a nonterminal episode is rejected by the reward gate. The agent-loop regression suite passes (28 tests).
+- Token conservation must extend to the optimizer input. The old batching path could floor the row count or discard excess rows after the adapter's conservation check. The candidate retention path keeps approved rows and pads only after advantage computation; padding carries zero action mask and zero advantage, so it creates no reward samples or loss-bearing tokens. Two real DataProto CPU tests verify conservation and input immutability.
+- Preserve a recovery point after the first completed update. Validate every actor/model, optimizer, RNG/scheduler, and dataloader shard before publishing the directory and tracker; retain the previous checkpoint on partial, corrupt, or failed tracker writes. Actor and critic fault-injection checks pass; an isolated long-sequence GPU preflight is still in progress. These checks establish correctness and recoverability, not benchmark improvement.
+- Compare the fixed held-out questions under the same agent time, grading time, temperature, output budget, and terminal-score rules. An older score obtained under a different time allowance is historical context, not a matched baseline. Missing or rejected evaluations stay explicitly unscored.
