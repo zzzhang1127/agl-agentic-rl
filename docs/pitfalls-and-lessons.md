@@ -4117,7 +4117,7 @@ Qwen3.5-9B 的验证没有停。服务器上没有 Qwen3.6-9B。两套 vLLM 都�
 
 **已确认修复 2：checkpoint 原子替换已经在 PPO trainer 里。** `AgentLightningRayPPOTrainer._save_checkpoint()` 已有 staging `.tmp` → validate → rename/replace → tracker 原子写入 → prune 的逻辑；本轮不再重复发明保存器。当前 smoke 配置把 `save_freq=2`，按实测 step 时间折算到约半小时一存，后续长跑再按真实 step 时长调整。
 
-**坑 1：Ray worker 不是直接用当前脚本的 `sys.path`。** attempt6/6b 在主进程用 `code_v6*` 快照启动，Ray worker 却从服务器 checkout `/data/zhizhong/projects/agent-lightning` import `agentlightning`，导致 `ModuleNotFoundError: agentlightning.verl.critic_worker` 或反序列化找不到新类。只改快照目录不够，Ray remote class 的 module 路径必须在 worker 侧也可 import。临时解决：把 `entrypoint.py`/`critic_freeze.py` 同步到服务器 checkout，或显式设置 Ray `runtime_env`/`working_dir`，不能依赖主进程 `sys.path.insert()`。
+**坑 1：Ray worker 不是直接用当前脚本的 `sys.path`。** attempt6/6b 在主进程用 `code_v6*` 快照启动，Ray worker 却从服务器 checkout `/data/agl-example/projects/agent-lightning` import `agentlightning`，导致 `ModuleNotFoundError: agentlightning.verl.critic_worker` 或反序列化找不到新类。只改快照目录不够，Ray remote class 的 module 路径必须在 worker 侧也可 import。临时解决：把 `entrypoint.py`/`critic_freeze.py` 同步到服务器 checkout，或显式设置 Ray `runtime_env`/`working_dir`，不能依赖主进程 `sys.path.insert()`。
 
 **坑 2：把自定义 worker 类放在单独新文件里容易踩 Ray 反序列化。** attempt6b 里 `_AglTaskRunner` 能跑起来，但 worker import `agentlightning.verl.critic_worker` 失败；attempt6c 改成动态 mixin 后，又因为 worker 仍加载旧 checkout 而报 `Can't get attribute AttentionFrozenCriticWorkerMixin`。经验：Ray remote/actor 用到的新类最好放在 worker 一定会加载的稳定 module 中，并确认远端进程打印的 `__file__` 是预期路径。
 
