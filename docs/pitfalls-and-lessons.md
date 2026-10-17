@@ -4239,3 +4239,9 @@ Checkpoint tests must include the real inference/training memory lifecycle, not 
 The first isolated save test published all13files with valid ZIP CRCs, then exposed a separate HYBRID-mode limitation: the public replica wake-up endpoint is unsupported. The restoration candidate now uses the installed native weight-synchronization path, which already restores HYBRID replicas in normal training. A second isolated test covers save, restoration, CRC and native load before formal deployment. The synthetic checkpoint from the first test was removed after its publication evidence was retained; it was never a real training checkpoint.
 
 The second isolated native lifecycle test completed with exit0: checkpoint save,13-file ZIP CRC validation,HYBRID restoration through native weight synchronization,and native model/optimizer/RNG/scheduler loading all passed. Its synthetic checkpoint was removed after verification. A new formal run includes both the empty-padding and checkpoint-memory fixes; its first real checkpoint is still pending. Storage planning now uses the measured~28.14GiB checkpoint size,including temporary old/new copies and the16GiB runtime floor. User-approved historical-log compression verifies decompressed SHA-256 before replacement and skips open files,retaining complete log contents.
+
+### 2026-10-17：正式 GRPO 更新与保存验收
+
+原生 Smith 四卡 GRPO 已完成两个真实训练步；step2 的 274,371 个有效输出/action-mask/logprob/optimizer 动作 token 完全一致，参数发生变化，13 个原生检查点文件 CRC 通过，旧 step1 已清理。两个工程故障的修复已在真实数据和实际保存流程中验收。固定 100 题训练后探针尚未完成，不能宣称效果提升。详见[原生 GRPO 工程验收](grpo-native-20261017.md)。
+
+历史已关闭日志的无损压缩全部结束：156 份文件释放 24.61 GiB；逐份验证解压 SHA-256 和 gzip CRC，完整内容保留。正在使用的日志未处理。
