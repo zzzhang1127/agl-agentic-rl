@@ -4275,3 +4275,9 @@ The second isolated native lifecycle test completed with exit0: checkpoint save,
 准备诊断时，普通vanilla PPO的CPU样例先通过，但读取正式配置后发现实际选择的是`per_rollout_mean`，且训练在loss前按轨迹token数和行数归一化Advantage。诊断工具如果只验证熟悉的vanilla路径，会遗漏正式路径。工具现校验正式loss模块的哈希、注册同一个loss，并先执行同样的轨迹归一化再冻结Advantage；未知或未归一化的实际路径拒绝继续。
 
 正式损失配置下的独立CPU合成样例，以学习率`1e-7`重复32次后，正Advantage动作logprob上升约`4.27e-6`、负Advantage下降约`4.27e-6`，mask外梯度为0；回归还检查PPO裁剪边界。这仅证明小样例下的目标函数与观测工具合同，未加载真实模型或拟合真实冻结轨迹，也未验证分布式梯度缩放、真实参数更新或新rollout收益。公开工具测试本地8通过、1个可选依赖模块skip；已有服务器环境11通过，额外执行了正式配置的完整CLI。不能把这些结果替代用户要求的真实固定批实验。
+
+### 2026-10-18：冻结文件不等于损失使用固定旧策略
+
+真实固定批诊断发现，原生 actor 的单 minibatch、单 epoch 快捷路径可能使用当前 logprob.detach 作为旧值。即使冻结文件未变化，也不能据此称固定 old-logprob 实验成立。独立诊断显式选择 rollout logprob，并在实际损失边界校验 old-logprob 和 Advantage 指纹后，才接受 16 次真实更新的窄结果；正式单次更新路径未改。worker instrumentation 还必须保留原生 loss 注册，推理副本初始化已休眠时不要再次无条件 sleep。详见[当日真实固定批验收](grpo-native-20261018.md)。
+
+评分 Job 的 Complete、运行时导入成功和独立 fixture 通过都不等于真实模型奖励闭环通过。需要实际提交、完整报告、独立事件门禁以及归档奖励一致；未完成的全量验证不能写成无评分故障或可靠收益。
